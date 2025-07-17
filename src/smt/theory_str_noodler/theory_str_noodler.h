@@ -212,9 +212,6 @@ namespace smt::noodler {
          */
         void collect_statistics(::statistics & st) const override;
 
-        // FIXME ensure_enode is non-virtual function of theory, why are we redegfining it?
-        enode* ensure_enode(expr* e);
-
         void add_length_axiom(expr* n);
         /**
          * @brief Add special axioms for conversions.

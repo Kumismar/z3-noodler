@@ -43,15 +43,6 @@ namespace smt::noodler {
         STRACE(str, tout << "init" << std::endl;);
     }
 
-    enode *theory_str_noodler::ensure_enode(expr *e) {
-        if (!ctx.e_internalized(e)) {
-            ctx.internalize(e, false);
-        }
-        enode *n = ctx.get_enode(e);
-        ctx.mark_as_relevant(n);
-        return n;
-    }
-
     theory_var theory_str_noodler::mk_var(enode *const n) {
         if (!m_util_s.is_seq(n->get_expr()) &&
             !m_util_s.is_re(n->get_expr())) {
