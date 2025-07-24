@@ -59,19 +59,18 @@ namespace smt::noodler {
     }
 
 
-    bool theory_str_noodler::internalize_atom(app *const atom, const bool gate_ctx) {
+    bool theory_str_noodler::internalize_atom(app* atom, bool gate_ctx) {
         (void) gate_ctx;
         STRACE(str, tout << "internalize_atom: gate_ctx is " << gate_ctx << ", "
                            << mk_pp(atom, get_manager()) << '\n';);
-        context &ctx = get_context();
         if (ctx.b_internalized(atom)) {
-            STRACE(str, tout << "done before\n";);
             return true;
         }
         return internalize_term(atom);
     }
 
-    bool theory_str_noodler::internalize_term(app *const term) {
+    bool theory_str_noodler::internalize_term(app* term) {
+        STRACE(str, tout << "internalize_term: " << mk_pp(term, get_manager()) << '\n';);
         context &ctx = get_context();
 
         if (m_util_s.str.is_in_re(term)) {
@@ -140,8 +139,8 @@ namespace smt::noodler {
                     mark_expression_as_length(len_arg);
                 }
             }
-            ctx.mark_as_relevant(ex);
-            string_theory_propagation(ex, true, false);  
+            // ctx.mark_as_relevant(ex);
+            // string_theory_propagation(ex, true, false);  
         }
         add_conversion_num_axioms();
         STRACE(str, tout << __LINE__ << " leave " << __FUNCTION__ << std::endl;);
