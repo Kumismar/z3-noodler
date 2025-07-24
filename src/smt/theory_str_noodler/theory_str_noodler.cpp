@@ -538,10 +538,10 @@ namespace smt::noodler {
 
         // This is to handle the case containing ite inside disequations
         // TODO explain better
-        if(!ctx.e_internalized(equation)) {
-            STRACE(str, tout << "relevanting: " << mk_pp(disequation, m) << std::endl;);
+        // if(!ctx.e_internalized(equation)) {
+        //     STRACE(str, tout << "relevanting: " << mk_pp(disequation, m) << std::endl;);
             ctx.mark_as_relevant(disequation);
-        }
+        // }
         ctx.internalize(disequation, false);
 
         if(m_util_s.is_re(l) && m_util_s.is_re(r)) { // language disequation
