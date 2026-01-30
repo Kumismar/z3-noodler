@@ -533,6 +533,12 @@ namespace smt::noodler {
         STRACE(str, tout << "new_eq: " << l <<  " = " << r << std::endl;);
 
         app* equation = m.mk_eq(l, r);
+        bool swap = false;
+
+        if (m_util_s.str.is_string(l)) {
+            equation = m.mk_eq(r, l);
+            swap= true;
+        }
 
         // TODO explain what is happening here
         if(!ctx.e_internalized(equation)) {
@@ -551,7 +557,11 @@ namespace smt::noodler {
                 add_axiom({mk_literal(m.mk_not(equation))});
             } else if (!m.is_true(equation_atom)) {
                 // if equation is not trivially true, we add it for later check
-                m_word_eq_todo.push_back({l, r});
+                if (swap) {
+                    m_word_eq_todo.push_back({r, l});
+                } else {
+                    m_word_eq_todo.push_back({l, r});
+                }
 
                 // Optimization: If equation holds, then the lengths of both sides must be the same.
                 // We do this only if the equation (or its inverse) is already for sure relevant,
