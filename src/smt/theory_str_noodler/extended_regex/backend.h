@@ -15,7 +15,11 @@
 #include <variant>
 #include <vector>
 
-namespace smt::noodler::ecma {
+// Common backend of the extended regexes (ECMAScript, ...): the common AST produced by the frontends, its conversion
+// into the Regex Constraint Graph (RCG), and the generation of string constraints by a DFS over the RCG.
+namespace smt::noodler::extended_regex {
+    class ExtendedRegex;
+
     // ======================= UTILS =======================
     using Z3Char = uint32_t;
 
@@ -23,18 +27,10 @@ namespace smt::noodler::ecma {
     constexpr uint64_t UNBOUNDED = std::numeric_limits<uint64_t>::max();
 
     /**
-     * @brief Convert utf-8 @p raw_input into a sanitized form where each Z3Char (uint32_t) represents a single Unicode
-     * code point.
-     *
-     * Characters above 0xFF were already decoded by the SMT-LIB parser and are kept as they are. Invalid UTF-8
-     * sequences are replaced by U+FFFD. ECMAScript escape sequences (such as `\u0041`) are kept untouched, they are
-     * part of the pattern grammar and they are decoded by ECMAParser.
-     *
-     * @param raw_input The original ECMA regex pattern as a UTF-8 encoded string. May contain multi-byte
-     *                  characters.
-     * @return zstring The sanitized regex pattern.
+     * @brief Printable ASCII characters are printed quoted ('a'), all other characters as U+XXXX. Used for
+     * serialization and error messages.
      */
-    zstring sanitize_ecma_regex_input(const zstring& raw_input);
+    std::string char_to_string(Z3Char ch);
 
     // =============== REGEX CONSTRAINT GRAPH ===============
 
@@ -132,7 +128,7 @@ namespace smt::noodler::ecma {
     constexpr VertexID UNKNOWN_VERTEX = std::numeric_limits<VertexID>::max();
 
     /**
-     * The Regex Constraint Graph (RCG) encodes the structure of an ECMA regex.
+     * The Regex Constraint Graph (RCG) encodes the structure of an extended regex.
      * Vertices represent split points where the regex transitions between regular and non-regular components, or other
      * structural boundaries (such as alternations).
      *
@@ -203,9 +199,11 @@ namespace smt::noodler::ecma {
      */
     GraphFragment make_epsilon_fragment(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m);
 
-    // ================== ECMA REGEX AST ==================
+    // ================== COMMON REGEX AST ==================
     //
-    // The AST follows the regex grammar of ECMA-262 2020, section 21.2.1 Patterns.
+    // The common AST is produced by the frontends of all regex flavors. It is close to the regex grammar of ECMA-262
+    // 2020 (section 21.2.1 Patterns), but the flavor-specific meaning of predefined character classes (., \d, \s, ...)
+    // is resolved by the frontends into explicit sets of characters (CharSet).
 
     /**
      * Quantifier of a term (21.2.1 Quantifier, semantics in 21.2.2.7).
@@ -234,33 +232,6 @@ namespace smt::noodler::ecma {
     };
 
     /**
-     * Alternatives of the CharacterClassEscape production (21.2.1 CharacterClassEscape, semantics in 21.2.2.12).
-     */
-    enum class ClassEscapeKind {
-        DIGIT,         // \d
-        NOT_DIGIT,     // \D
-        SPACE,         // \s
-        NOT_SPACE,     // \S
-        WORD,          // \w
-        NOT_WORD,      // \W
-        PROPERTY,      // \p{...}
-        NOT_PROPERTY,  // \P{...}
-    };
-
-    /**
-     * A character class escape (\d, \s, \w, \p{...} and their negations).
-     *
-     * For \p{...} and \P{...}, `property_name` and `property_value` are views of the source text of
-     * UnicodePropertyName and UnicodePropertyValue in the pattern. For the lone form (e.g. \p{Lu}), `property_name` is
-     * empty and `property_value` holds the LoneUnicodePropertyNameOrValue.
-     */
-    struct CharClassEscape {
-        ClassEscapeKind kind = ClassEscapeKind::DIGIT;
-        zstring_view property_name;
-        zstring_view property_value;
-    };
-
-    /**
      * An inclusive range of characters in a character class. A single character `c` is stored as {c, c}.
      */
     struct ClassRange {
@@ -268,7 +239,33 @@ namespace smt::noodler::ecma {
         Z3Char hi = 0;
     };
 
-    using ClassItem = std::variant<ClassRange, CharClassEscape>;
+    /**
+     * A predefined set of characters given by a frontend, e.g. \d, \S or . in ECMAScript.
+     *
+     * The set contains the characters of `ranges`, or all the other characters if `negated` is true. `source` is a view
+     * of the source text in the pattern (e.g. \d), used only for serialization.
+     */
+    struct CharSet {
+        std::vector<ClassRange> ranges;
+        bool negated = false;
+        zstring_view source;
+    };
+
+    /**
+     * A set of characters given by a Unicode property, e.g. \p{Lu} or \P{Script=Greek}. Not supported by the backend
+     * yet.
+     *
+     * `name` and `value` are views of the property name and value in the pattern. For the lone form (e.g. \p{Lu}),
+     * `name` is empty. `source` is a view of the whole source text (e.g. \p{Lu}).
+     */
+    struct UnicodeProperty {
+        bool negated = false;
+        zstring_view name;
+        zstring_view value;
+        zstring_view source;
+    };
+
+    using ClassItem = std::variant<ClassRange, CharSet, UnicodeProperty>;
 
     /**
      * The result type of ASTNode::get_subgraph(). Each AST node converts itself into
@@ -536,17 +533,6 @@ namespace smt::noodler::ecma {
     };
 
     /**
-     * Atom :: . -- matches any single character except line terminators (21.2.2.8, the `s` flag is not supported).
-     */
-    class ASTNodeDot : public ASTNode {
-    public:
-        uint64_t print_dot(std::ostream& out, uint64_t& node_count) const override;
-        zstring serialize() const override;
-        RegexComponent get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const override;
-        ASTNodeRef clone() const override;
-    };
-
-    /**
      * A backreference: Atom :: \ DecimalEscape (\1) or Atom :: \k GroupName (\k<name>). Named backreferences are
      * resolved to the group number by the parser. Always returns a GraphFragment with a single BackrefEdge.
      */
@@ -616,11 +602,11 @@ namespace smt::noodler::ecma {
     };
 
     /**
-     * A character class: Atom :: CharacterClass (like [abc], [^a-z\d]). A character class escape outside of a class
-     * (Atom :: \ CharacterClassEscape, e.g. \d) is represented as a class with a single item.
+     * A character class: Atom :: CharacterClass (like [abc], [^a-z\d]). A predefined set of characters outside of a
+     * class (e.g. \d or .) is represented as a class with a single item.
      *
-     * The items of the class are stored as a flat list of ranges (single characters are ranges {c, c}) and character
-     * class escapes.
+     * The items of the class are stored as a flat list of ranges (single characters are ranges {c, c}), predefined sets
+     * of characters and Unicode properties. The class matches the union of its items, or its complement if negated.
      */
     class ASTNodeCharClass : public ASTNode {
     public:
@@ -637,109 +623,6 @@ namespace smt::noodler::ecma {
     private:
         bool m_is_negated;
         std::vector<ClassItem> m_items;
-    };
-
-    // =============== ECMA REGEX PARSER ===============
-
-    /**
-     * Recursive descent parser of ECMAScript regex patterns.
-     *
-     * The parser follows the grammar of ECMA-262 2020, 21.2.1 Patterns, with the goal symbol Pattern[+U, +N], i.e., as
-     * if the `u` flag was always set (21.2.3.2.2 RegExpInitialize, step 8). Therefore, the Annex B extensions (B.1.4)
-     * are not used, since they apply only to [~U] patterns. The other flags are not supported (they are considered
-     * unset).
-     *
-     * The regex grammar is a lexical one -- the meaning of a character depends on its context (inside/outside of a
-     * character class, after '\' or after '(?'), so the parser reads code points directly without a separate lexer.
-     * Each nonterminal of the grammar has its own parse_* method. The early errors (21.2.1.1) are checked during
-     * parsing, except for the ones concerning backreferences, which are checked after the whole pattern is parsed
-     * (backreferences can point forward).
-     *
-     * All errors are reported via util::throw_error.
-     *
-     * The AST keeps views (zstring_view) into the pattern (group names, Unicode property names), so the pattern must
-     * outlive the AST.
-     */
-    class ECMAParser {
-    public:
-        explicit ECMAParser(const zstring_view pattern)
-            : m_pattern(pattern) { }
-
-        /**
-         * @brief Parse the whole Pattern and check its early errors.
-         *
-         * @return ASTNodeRef The root of the AST.
-         */
-        ASTNodeRef parse();
-
-        /**
-         * @brief Return NcapturingParens, the number of capturing groups in the parsed pattern.
-         */
-        GroupID num_capturing_groups() const;
-
-    private:
-        // Names are compared by their StringValue (21.2.1.6) -- the escape sequences are replaced, so the name can
-        // differ from the source text and it cannot be a view into the pattern.
-        struct NamedGroup {
-            zstring name;
-            GroupID gid;
-        };
-
-        // A backreference whose group is checked/resolved after the whole pattern is parsed.
-        struct PendingBackref {
-            ASTNodeBackreference* node;
-            std::size_t position;
-            zstring name;  // StringValue of the GroupName, empty for numeric backreferences
-        };
-
-        // The result of the ClassAtom production -- a single character or a character class escape.
-        struct ClassAtom {
-            bool is_class = false;
-            Z3Char value = 0;
-            CharClassEscape escape {};
-        };
-
-        zstring_view m_pattern;
-        std::size_t m_pos = 0;
-        GroupID m_num_capturing_groups = 0;
-        std::vector<NamedGroup> m_named_groups;
-        std::vector<PendingBackref> m_pending_backrefs;
-
-        // ---- reading the pattern ----
-        bool at_end() const;
-        Z3Char peek(std::size_t offset = 0) const;
-        Z3Char advance();
-        bool eat(Z3Char ch);
-        void expect(Z3Char ch, const char* what);
-        void syntax_error(const std::string& message, std::size_t position) const;
-        void syntax_error(const std::string& message) const;
-
-        // ---- grammar productions (21.2.1) ----
-        ASTNodeRef parse_disjunction();
-        ASTNodeRef parse_alternative();
-        ASTNodeRef parse_term();
-        ASTNodeRef try_parse_assertion();
-        bool try_parse_quantifier(Quantifier& quantifier);
-        uint64_t parse_decimal_digits(const char* what);
-        ASTNodeRef parse_atom();
-        ASTNodeRef parse_group();
-        ASTNodeRef parse_atom_escape();
-        Z3Char parse_character_escape();
-        bool try_parse_character_class_escape(CharClassEscape& escape);
-        void parse_unicode_property_value_expression(CharClassEscape& escape);
-        Z3Char parse_regexp_unicode_escape_sequence();
-        bool try_parse_hex4_digits(std::size_t offset, Z3Char& value) const;
-        zstring parse_group_name(zstring_view& source_text);
-        Z3Char parse_regexp_identifier_char(bool is_start);
-        ASTNodeRef parse_character_class();
-        void parse_class_ranges(ASTNodeCharClass& char_class);
-        ClassAtom parse_class_atom();
-        ClassAtom parse_class_escape();
-
-        // ---- capturing groups and backreferences ----
-        GroupID create_capturing_group();
-        void register_group_name(const zstring& name, GroupID gid, std::size_t position);
-        void resolve_backreferences();
     };
 
     // ================= DFS CONTEXT CLASSES ==================
@@ -1017,23 +900,21 @@ namespace smt::noodler::ecma {
         expr_ref concat_expr_vector(const expr_ref_vector& vars, uint32_t start_idx, uint32_t end_idx) const;
     };
 
-    // =============== ECMA REGEX HANDLER ===============
+    // =============== REGEX CONSTRAINT BUILDER ===============
 
     /**
-     * Top-level class for translating an ECMA regex into Z3 string constraints.
+     * Top-level class for translating an extended regex (of any flavor) into Z3 string constraints.
      *
      * Usage:
-     *   1. Construct with the regex pattern string.
+     *   1. Construct with the regex (a frontend of some flavor, see ExtendedRegex). The regex must outlive the builder.
      *   2. Call build_rcg() once to parse the regex and build the RCG.
      *   3. Call generate_constraints(target) to produce an SMT2 formula that is satisfiable
      *      iff target matches the regex.
      */
     class RegexConstraintBuilder {
     public:
-        RegexConstraintBuilder(ast_manager& m, const zstring& regex_pattern, const theory_str_noodler_params& params)
-            : m_sanitized_regex_storage(sanitize_ecma_regex_input(regex_pattern)),
-              m_regex(m_sanitized_regex_storage),
-              m_parser(m_regex),
+        RegexConstraintBuilder(ast_manager& m, const ExtendedRegex& regex, const theory_str_noodler_params& params)
+            : m_regex(regex),
               m_manager(m),
               m_params(params),
               m_util_s(m),
@@ -1079,9 +960,7 @@ namespace smt::noodler::ecma {
         const app_ref_vector& get_fresh_vars() const;
 
     private:
-        zstring m_sanitized_regex_storage; 
-        zstring_view m_regex;
-        ECMAParser m_parser;
+        const ExtendedRegex& m_regex;
         ast_manager& m_manager;
         const theory_str_noodler_params& m_params;
         seq_util m_util_s;
@@ -1142,4 +1021,4 @@ namespace smt::noodler::ecma {
          */
         void rcg_dfs_visit(VertexID current_vertex, DFSContext& ctx);
     };
-}  // namespace smt::noodler::ecma
+}  // namespace smt::noodler::extended_regex

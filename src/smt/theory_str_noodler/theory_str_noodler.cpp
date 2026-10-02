@@ -17,7 +17,8 @@ Eternal glory to Yu-Fang.
 #include "ast/seq_decl_plugin.h"
 #include "ast/reg_decl_plugins.h"
 #include "theory_str_noodler.h"
-#include "ecma_regex.h"
+#include "extended_regex/backend.h"
+#include "extended_regex/extended_regex.h"
 
 namespace smt::noodler {
 
@@ -498,7 +499,7 @@ namespace smt::noodler {
         ) {
             handle_conversion(n);
         } else if (m_util_s.str.is_in_re_from_ecma2020(n)) { // str.in_re with re.from_ecma2020
-            handle_ecma_re(n);
+            handle_extended_re(n);
         } else if (util::is_str_variable(n, m_util_s)) {
             BasicTerm var_for_n = util::get_variable_basic_term(n);
             SASSERT(!var_name.contains(var_for_n) || var_name.at(var_for_n) == n);
@@ -2235,15 +2236,22 @@ namespace smt::noodler {
         add_axiom({~lit_e, lit_x_eps,  mk_literal(to_code_lt)});
     }
 
-    void theory_str_noodler::handle_ecma_re(expr* e) {
+    void theory_str_noodler::handle_extended_re(expr* e) {
+        // Determine the flavor of the extended regex from the regex operator
         expr* x = nullptr;
         zstring pattern;
-        if (!m_util_s.str.is_in_re_from_ecma2020(e, x, pattern)) {
+        using namespace extended_regex;
+        RegexFlavor flavor;
+        if (m_util_s.str.is_in_re_from_ecma2020(e, x, pattern)) {
+            flavor = RegexFlavor::ECMA2020;
+        } else {
             util::throw_error("We can only handle (str.in_re ... (re.from_ecma2020 pattern)) with a constant pattern");
             return;
         }
 
-        ecma::RegexConstraintBuilder builder(m, pattern, m_params);
+        // The regex must outlive the builder
+        const std::unique_ptr<ExtendedRegex> regex = make_extended_regex(flavor, pattern);
+        RegexConstraintBuilder builder(m, *regex, m_params);
         builder.build_rcg();
 
         SASSERT(is_app(x));
