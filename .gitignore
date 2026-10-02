@@ -43,6 +43,7 @@ build-dist/*
 dist/*
 src/out/*
 doc/html/*
+**/graphify-out/*
 # GTAGS generated files
 src/GPATH
 src/GRTAGS
