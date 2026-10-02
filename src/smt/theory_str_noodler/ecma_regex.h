@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <ostream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -16,49 +17,21 @@
 
 namespace smt::noodler::ecma {
     // ======================= UTILS =======================
-    enum class TokenType {
-        ALTERNATION,             // |
-        ASSERTION,               // ^, $, \b, \B
-        BACKREFERENCE,           // \1, \2, \k<name>
-        CHAR_CLASS_START,        // [
-        CHAR_CLASS_END,          // ]
-        CHAR_CLASS_NEGATION,     // '^' after '['
-        CHAR_CLASS_RANGE,        // '-' inside '[]'
-        CHAR_CLASS_ESCAPE,       // \d, \D, \s, \S, \w, \W
-        DOT,                     // .
-        END_OF_INPUT,            // EOF
-        GROUP_START,             // (
-        GROUP_NONCAPTURE_START,  // (?:
-        GROUP_NAMED_START,       // (?<name>
-        LOOKAHEAD_POS_START,     // (?=
-        LOOKAHEAD_NEG_START,     // (?!
-        LOOKBEHIND_POS_START,    // (?<=
-        LOOKBEHIND_NEG_START,    // (?<!
-        GROUP_END,               // )
-        LITERAL,                 // a, b, c, ...
-        QUANTIFIER,              // *, +, ?, {n,m}
-    };
-
     using Z3Char = uint32_t;
 
-    struct QuantifierRange {
-        uint64_t min;
-        uint64_t max;
-    };
-
-    // no payload, literal/escape, quantifier_range, capture group names/raw string data
-    using TokenPayload = std::variant<std::monostate, Z3Char, QuantifierRange, zstring_view>;
-
-    struct Token {
-        TokenType type;
-        TokenPayload payload;
-        zstring_view lexeme;
-    };
+    // Upper bound of an unbounded quantifier ('*', '+', '{n,}').
+    constexpr uint64_t UNBOUNDED = std::numeric_limits<uint64_t>::max();
 
     /**
-     * @brief Convert utf-8 @p raw_input into a sanitized form where each Z3Char (uint32_t) represents a single Unicode code point.
-     * 
-     * @param raw_input The original ECMA regex pattern as a UTF-8 encoded string. May contain multi-byte characters.
+     * @brief Convert utf-8 @p raw_input into a sanitized form where each Z3Char (uint32_t) represents a single Unicode
+     * code point.
+     *
+     * Characters above 0xFF were already decoded by the SMT-LIB parser and are kept as they are. Invalid UTF-8
+     * sequences are replaced by U+FFFD. ECMAScript escape sequences (such as `\u0041`) are kept untouched, they are
+     * part of the pattern grammar and they are decoded by ECMAParser.
+     *
+     * @param raw_input The original ECMA regex pattern as a UTF-8 encoded string. May contain multi-byte
+     *                  characters.
      * @return zstring The sanitized regex pattern.
      */
     zstring sanitize_ecma_regex_input(const zstring& raw_input);
@@ -192,8 +165,6 @@ namespace smt::noodler::ecma {
         EdgeID create_edge(VertexID target, RCGEdgePayload payload);
     };
 
-    zstring view_to_zstring(zstring_view view);
-
     /**
      * @brief Connect two fragments sequentially: first -> second.
      *
@@ -232,70 +203,72 @@ namespace smt::noodler::ecma {
      */
     GraphFragment make_epsilon_fragment(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m);
 
-    // ================== ECMA REGEX LEXER ==================
+    // ================== ECMA REGEX AST ==================
+    //
+    // The AST follows the regex grammar of ECMA-262 2020, section 21.2.1 Patterns.
 
     /**
-     * Tokenizes an ECMA regex string on demand.
+     * Quantifier of a term (21.2.1 Quantifier, semantics in 21.2.2.7).
      *
-     * The first call to get_next_token() triggers a one-time pre-scan of the entire regex string to count capture
-     * groups and populate the named group map. This is needed so that backreferences can be resolved correctly during
-     * lexing.
-     *
-     * After the pre-scan, tokens are produced one at a time as get_next_token() is called. The lexer maintains a flag
-     * m_in_char_class to switch between standard tokenization and character-class tokenization, since some characters
-     * have different semantics inside a character class.
+     * `max == UNBOUNDED` stands for infinity. `greedy` is false for the lazy forms (`*?`, `+?`, `??`, `{n,m}?`). The
+     * laziness does not change the set of strings matched by the regex.
      */
-    class ECMALexer {
-    public:
-        explicit ECMALexer(const zstring_view regex, std::unordered_map<zstring_view, GroupID>& named_groups)
-            : m_regex(regex),
-              m_named_groups(named_groups) { }
-
-        Token get_next_token();
-
-    private:
-        zstring_view m_regex;
-        std::size_t m_position = 0;
-        std::size_t m_lexeme_start_pos = 0;
-        std::size_t m_num_capture_groups = 0;
-        bool m_in_char_class = false;
-        bool m_first_in_char_class = false;
-        bool m_first_traverse = true;
-        std::unordered_map<zstring_view, GroupID>& m_named_groups;
-
-        static bool is_digit(Z3Char digit);
-        static bool is_alpha(Z3Char digit);
-        static bool is_alnum(Z3Char digit);
-        static bool is_hex_digit(Z3Char digit);
-        static bool is_octal_digit(Z3Char digit);
-        static bool is_upper(Z3Char digit);
-        static uint32_t alphabet_rank(Z3Char digit);
-        static Z3Char hex2char(zstring_view number);
-        static Z3Char oct2char(zstring_view number);
-
-        Token make_token(TokenType type, const TokenPayload& payload = {}) const;
-        Token get_hex_escape_seq_token();
-        Token get_unicode_escape_seq_token();
-        Token get_control_escape_seq_token();
-        Token get_named_capture_group_token();
-        uint32_t get_backref_name_len(uint32_t name_start_pos) const;
-        Token get_named_backref_token();
-        Token octal_or_backref(Z3Char first_digit);
-        Token get_octal_escape_sequence_token(bool from_char_class, Z3Char first_digit);
-        uint32_t validate_and_get_bound(uint64_t& bound_value);
-        Token get_braced_quant_token();
-        Token get_lookbehind_or_named_group_token();
-        Token get_special_group_or_lookaround_token();
-        Token get_group_token();
-        Token get_escape_sequence_token();
-        Token get_token_standard();
-        Token get_char_class_escape_sequence_token();
-        Token get_token_char_class();
-        std::pair<bool, zstring_view> is_capture_or_named_capture(uint32_t position) const;
-        void perform_first_traverse();
+    struct Quantifier {
+        uint64_t min = 0;
+        uint64_t max = UNBOUNDED;
+        bool greedy = true;
     };
 
-    // ================== ECMA REGEX AST ==================
+    /**
+     * Alternatives of the Assertion production (21.2.1 Assertion, semantics in 21.2.2.6).
+     */
+    enum class AssertionKind {
+        START,              // ^
+        END,                // $
+        WORD_BOUNDARY,      // \b
+        NOT_WORD_BOUNDARY,  // \B
+        LOOKAHEAD,          // (?=...)
+        NEG_LOOKAHEAD,      // (?!...)
+        LOOKBEHIND,         // (?<=...)
+        NEG_LOOKBEHIND,     // (?<!...)
+    };
+
+    /**
+     * Alternatives of the CharacterClassEscape production (21.2.1 CharacterClassEscape, semantics in 21.2.2.12).
+     */
+    enum class ClassEscapeKind {
+        DIGIT,         // \d
+        NOT_DIGIT,     // \D
+        SPACE,         // \s
+        NOT_SPACE,     // \S
+        WORD,          // \w
+        NOT_WORD,      // \W
+        PROPERTY,      // \p{...}
+        NOT_PROPERTY,  // \P{...}
+    };
+
+    /**
+     * A character class escape (\d, \s, \w, \p{...} and their negations).
+     *
+     * For \p{...} and \P{...}, `property_name` and `property_value` are views of the source text of
+     * UnicodePropertyName and UnicodePropertyValue in the pattern. For the lone form (e.g. \p{Lu}), `property_name` is
+     * empty and `property_value` holds the LoneUnicodePropertyNameOrValue.
+     */
+    struct CharClassEscape {
+        ClassEscapeKind kind = ClassEscapeKind::DIGIT;
+        zstring_view property_name;
+        zstring_view property_value;
+    };
+
+    /**
+     * An inclusive range of characters in a character class. A single character `c` is stored as {c, c}.
+     */
+    struct ClassRange {
+        Z3Char lo = 0;
+        Z3Char hi = 0;
+    };
+
+    using ClassItem = std::variant<ClassRange, CharClassEscape>;
 
     /**
      * The result type of ASTNode::get_subgraph(). Each AST node converts itself into
@@ -336,7 +309,7 @@ namespace smt::noodler::ecma {
         /**
          * @brief Return a deep copy of this node and all its children.
          *
-         * Used by ASTNodeQuantifier::unroll() to duplicate the quantified subpattern multiple times without sharing AST
+         * Used by ASTNodeQuantified::unroll() to duplicate the quantified subpattern multiple times without sharing AST
          * nodes between copies.
          *
          * @return ASTNodeRef An independent copy of this node.
@@ -344,36 +317,31 @@ namespace smt::noodler::ecma {
         virtual ASTNodeRef clone() const = 0;
 
         /**
-         * @brief Recursively convert all CAPTURE groups in this subtree to NONCAPTURE.
-         *
-         * Called when the subtree is under a fixed quantifier {n,m} to capture correct strings for further
-         * backreferences (the ECMAScript standard requires the last matched string in the quantifier to be captured by
-         * the group). Therefore, only the last capturing group is left as a CAPTURE group, all the preceding are marked
-         * as NONCAPTURE.
+         * @brief Recursively convert all capturing groups in this subtree to non-capturing ones.
          */
-        virtual void strip_captures() = 0;
+        virtual void strip_captures() { }
 
         /**
          * @brief Recursively collect IDs of all backreferences in this subtree.
          *
          * Used as a pre-pass before `build_rcg()` to determine which capture groups are actually referenced. The result
-         * is passed to `strip_unreferenced_captures()` to convert unreferenced CAPTURE groups to NONCAPTURE, leading to
-         * fewer unsupported regex structure errors.
+         * is passed to `strip_unreferenced_captures()` to convert unreferenced capturing groups to non-capturing ones,
+         * leading to fewer unsupported regex structure errors.
          *
          * @param refs Set to which every backreference ID found in the subtree is added.
          */
         virtual void collect_backrefs(std::unordered_set<GroupID>& refs) const { }
 
         /**
-         * @brief Convert every CAPTURE group whose ID is not in @p referenced to NONCAPTURE.
-         * 
-         * @param referenced 
+         * @brief Convert every capturing group whose ID is not in @p referenced to a non-capturing one.
+         *
+         * @param referenced IDs of the groups referenced by some backreference.
          */
         virtual void strip_unreferenced_captures(const std::unordered_set<GroupID>& referenced) { }
     };
 
     /**
-     * AST node for alternation.
+     * Disjunction :: Alternative | Alternative '|' Disjunction
      *
      * Holds a list of alternative sub-patterns.
      */
@@ -409,9 +377,9 @@ namespace smt::noodler::ecma {
     };
 
     /**
-     * AST node for a sequence (concatenation) of terms.
+     * Alternative :: [empty] | Alternative Term
      *
-     * Holds an ordered list of terms.
+     * Holds an ordered list of terms (a concatenation).
      */
     class ASTNodeAlternative : public ASTNode {
     public:
@@ -441,7 +409,7 @@ namespace smt::noodler::ecma {
     };
 
     /**
-     * AST node for an assertion: anchors (^, $), word boundaries (\b, \B), or lookarounds ((?=...), (?!...), (?<=...),
+     * Term :: Assertion -- anchors (^, $), word boundaries (\b, \B), or lookarounds ((?=...), (?!...), (?<=...),
      * (?<!...)).
      *
      * All assertions always produce a GraphFragment, even if the inner pattern of an assertion is non-regular.
@@ -449,11 +417,16 @@ namespace smt::noodler::ecma {
      */
     class ASTNodeAssertion : public ASTNode {
     public:
+        /**
+         * @param kind       The kind of the assertion.
+         * @param subpattern The inner Disjunction of a lookaround, must be nullptr for ^, $, \b and \B.
+         */
+        explicit ASTNodeAssertion(AssertionKind kind, ASTNodeRef subpattern = nullptr);
+
         uint64_t print_dot(std::ostream& out, uint64_t& node_count) const override;
         zstring serialize() const override;
-        void set_type(TokenType type);
-        void set_payload(Z3Char payload);
-        void set_expr(ASTNodeRef expr);
+        AssertionKind get_kind() const;
+        bool is_lookaround() const;
 
         /**
          * @brief Builds the constraint graph fragment for zero-width assertions.
@@ -469,9 +442,8 @@ namespace smt::noodler::ecma {
         void strip_unreferenced_captures(const std::unordered_set<GroupID>& referenced) override;
 
     private:
-        TokenType m_assert_type {};
-        Z3Char m_payload {};              // for ^, $, \b, \B assertions
-        ASTNodeRef m_subpattern = nullptr;  // for lookarounds (may be null for ^, $, \b, \B)
+        AssertionKind m_kind;
+        ASTNodeRef m_subpattern;  // only for lookarounds
 
         /**
          * @brief Create a two-vertex, fragment with a single AssertionEdge for a lookaround.
@@ -500,17 +472,18 @@ namespace smt::noodler::ecma {
     };
 
     /**
-     * AST node for a quantifier applied to a subpattern (*, +, ?, {n,m}, {n,}).
+     * Term :: Atom Quantifier -- an atom repeated according to the quantifier (*, +, ?, {n}, {n,}, {n,m}).
      *
-     * If the child is regular, get_subgraph() delegates to the corresponding Z3 API
-     * (mk_star, mk_plus, mk_loop). If the child is non-regular and the quantifier is
-     * bounded, the quantifier is unrolled into an explicit disjunction first.
+     * If the atom is regular, get_subgraph() builds the corresponding Z3 regex. If the atom is non-regular and the
+     * quantifier is bounded, the quantifier is unrolled into an explicit disjunction first.
      */
-    class ASTNodeQuantifier : public ASTNode {
+    class ASTNodeQuantified : public ASTNode {
     public:
+        ASTNodeQuantified(Quantifier quantifier, ASTNodeRef atom);
+
         uint64_t print_dot(std::ostream& out, uint64_t& node_count) const override;
         zstring serialize() const override;
-        void set(const Token& t, ASTNodeRef term);
+        const Quantifier& get_quantifier() const;
         ASTNodeRef clone() const override;
         void strip_captures() override;
 
@@ -518,52 +491,52 @@ namespace smt::noodler::ecma {
          * @brief Expand a bounded quantifier {min,max} into an explicit disjunction.
          *
          * Produces an ASTNodeDisjunction equivalent to:
-         *   (epsilon | child^min | ... | child^max)
+         *   (epsilon | atom^min | ... | atom^max)
          * where epsilon is included only when min == 0.
          *
-         * @return ASTNodeRef A new ASTNodeDisjunction semantically equivalent to the quantifier node.
+         * @return ASTNodeRef A new ASTNodeDisjunction semantically equivalent to the quantified node.
          */
         ASTNodeRef unroll() const;
 
         /**
-         * @brief Build the regex/subgraph for a quantifier node.
+         * @brief Build the regex/subgraph for a quantified atom.
          *
-         * Regular subregex -- create a {min, max} loop which keeps it regular.
-         * Nonregular subregex:
-         *      - Fixed quantifier -- unroll into an explicit disjunction of concatenations.
+         * Regular atom -- create a {min, max} loop which keeps it regular.
+         * Nonregular atom:
+         *      - Bounded quantifier -- unroll into an explicit disjunction of concatenations.
          *      - Unbounded quantifier -- unsupported, leads to dynamic number of string variables and constraints.
          *
-         * @return RegexComponent app_ref if the child is regular, GraphFragment otherwise.
+         * @return RegexComponent app_ref if the atom is regular, GraphFragment otherwise.
          */
         RegexComponent get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const override;
         void collect_backrefs(std::unordered_set<GroupID>& refs) const override;
         void strip_unreferenced_captures(const std::unordered_set<GroupID>& referenced) override;
 
     private:
-        QuantifierRange m_range {};
-        ASTNodeRef m_child;
+        Quantifier m_quantifier;
+        ASTNodeRef m_atom;
     };
 
     /**
-     * AST node for a single literal character.
+     * A single character: Atom :: PatternCharacter, or Atom :: \ CharacterEscape. The stored value is the
+     * CharacterValue of the character (21.2.1.4).
      */
-    class ASTNodeLiteral : public ASTNode {
+    class ASTNodeCharacter : public ASTNode {
     public:
+        explicit ASTNodeCharacter(Z3Char ch);
+
         uint64_t print_dot(std::ostream& out, uint64_t& node_count) const override;
         zstring serialize() const override;
-        void set_char(Z3Char ch);
         Z3Char get_char() const;
         RegexComponent get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const override;
         ASTNodeRef clone() const override;
 
-        void strip_captures() override { }
-
     private:
-        Z3Char m_char = std::numeric_limits<Z3Char>::max();
+        Z3Char m_char;
     };
 
     /**
-     * AST node for the dot metacharacter (.). Matches any single character.
+     * Atom :: . -- matches any single character except line terminators (21.2.2.8, the `s` flag is not supported).
      */
     class ASTNodeDot : public ASTNode {
     public:
@@ -571,46 +544,51 @@ namespace smt::noodler::ecma {
         zstring serialize() const override;
         RegexComponent get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const override;
         ASTNodeRef clone() const override;
-
-        void strip_captures() override { }
     };
 
     /**
-     * AST node for a backreference (\1, \k<name>). Always returns a GraphFragment with a single BackrefEdge.
+     * A backreference: Atom :: \ DecimalEscape (\1) or Atom :: \k GroupName (\k<name>). Named backreferences are
+     * resolved to the group number by the parser. Always returns a GraphFragment with a single BackrefEdge.
      */
-    class ASTNodeBackref : public ASTNode {
+    class ASTNodeBackreference : public ASTNode {
     public:
+        explicit ASTNodeBackreference(GroupID group_id, zstring_view group_name = zstring_view());
+
         uint64_t print_dot(std::ostream& out, uint64_t& node_count) const override;
         zstring serialize() const override;
-        void set_ref(GroupID backref_number);
+        GroupID get_group_id() const;
+        void set_group_id(GroupID group_id);
+        zstring_view get_group_name() const;
         RegexComponent get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const override;
         ASTNodeRef clone() const override;
-
-        void strip_captures() override { }
-
         void collect_backrefs(std::unordered_set<GroupID>& refs) const override;
 
     private:
-        GroupID m_backref_id;
-    };
-
-    enum class GroupType {
-        CAPTURE,
-        NONCAPTURE,
-        NAMED
+        GroupID m_group_id;
+        zstring_view m_group_name;  // source text of the GroupName, empty for numeric backreferences
     };
 
     /**
-     * AST node for a capturing group (...), non-capturing group (?:...). Named groups are already converted into
-     * indexed ones.
+     * A group: Atom :: ( GroupSpecifier Disjunction ) for capturing groups (optionally named), or
+     * Atom :: (?: Disjunction ) for non-capturing groups.
      */
     class ASTNodeGroup : public ASTNode {
     public:
+        /**
+         * @brief Create a non-capturing group.
+         */
+        explicit ASTNodeGroup(ASTNodeRef child);
+
+        /**
+         * @brief Create a capturing group with the number @p gid and optionally the @p name.
+         */
+        ASTNodeGroup(GroupID gid, ASTNodeRef child, zstring_view name = zstring_view());
+
         uint64_t print_dot(std::ostream& out, uint64_t& node_count) const override;
         zstring serialize() const override;
-        void set_type(GroupType type);
-        void set_expr(ASTNodeRef expr);
-        void set_id(GroupID gid);
+        bool is_capturing() const;
+        GroupID get_id() const;
+        zstring_view get_name() const;
 
         /**
          * @brief Build the subgraph for a group node.
@@ -631,97 +609,137 @@ namespace smt::noodler::ecma {
         void strip_unreferenced_captures(const std::unordered_set<GroupID>& referenced) override;
 
     private:
-        GroupType m_type = GroupType::CAPTURE;
-
+        bool m_capturing;
+        GroupID m_gid = 0;
+        zstring_view m_name;  // source text of the GroupName, empty for unnamed groups
         ASTNodeRef m_child;
-        GroupID m_gid;
-    };
-
-    enum class ElementType {
-        SINGLE,
-        RANGE,
-        ESCAPE
-    };
-
-    struct CharClassElement {
-        ElementType kind = ElementType::SINGLE;
-        Z3Char lower = 0;  // for SINGLE and ESCAPE, this serves as the value
-        Z3Char upper = std::numeric_limits<Z3Char>::max();
     };
 
     /**
-     * AST node for a character class (like [abc], [a-z], etc.)
+     * A character class: Atom :: CharacterClass (like [abc], [^a-z\d]). A character class escape outside of a class
+     * (Atom :: \ CharacterClassEscape, e.g. \d) is represented as a class with a single item.
      *
-     * Elements of the character class are stored as a flat list of SINGLE characters, RANGEs (lower-upper), and ESCAPEs
-     * (\d, \w, \s and their negations).
+     * The items of the class are stored as a flat list of ranges (single characters are ranges {c, c}) and character
+     * class escapes.
      */
     class ASTNodeCharClass : public ASTNode {
     public:
+        explicit ASTNodeCharClass(bool negated = false);
+
         uint64_t print_dot(std::ostream& out, uint64_t& node_count) const override;
         zstring serialize() const override;
-        void add_element(CharClassElement elem);
-        void set_negation(bool neg);
+        void add_item(ClassItem item);
+        bool is_negated() const;
+        const std::vector<ClassItem>& get_items() const;
         RegexComponent get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const override;
         ASTNodeRef clone() const override;
 
-        void strip_captures() override { }
-
     private:
-        bool m_is_negated = false;
-        std::vector<CharClassElement> m_elements;
+        bool m_is_negated;
+        std::vector<ClassItem> m_items;
     };
 
     // =============== ECMA REGEX PARSER ===============
 
     /**
-     * Recursive descent parser for ECMA regex syntax. Consumes tokens from ECMALexer and builds an AST.
-     * The grammar is approximately (simplified from the ECMA 2020 standard, because lexer takes care of some details):
-     *   disjunction  -> alternative ('|' alternative)*
-     *   alternative  -> term*
-     *   term         -> assertion | atom quantifier?
-     *   atom         -> literal | dot | backref | char_class_escape | group | char_class
+     * Recursive descent parser of ECMAScript regex patterns.
+     *
+     * The parser follows the grammar of ECMA-262 2020, 21.2.1 Patterns, with the goal symbol Pattern[+U, +N], i.e., as
+     * if the `u` flag was always set (21.2.3.2.2 RegExpInitialize, step 8). Therefore, the Annex B extensions (B.1.4)
+     * are not used, since they apply only to [~U] patterns. The other flags are not supported (they are considered
+     * unset).
+     *
+     * The regex grammar is a lexical one -- the meaning of a character depends on its context (inside/outside of a
+     * character class, after '\' or after '(?'), so the parser reads code points directly without a separate lexer.
+     * Each nonterminal of the grammar has its own parse_* method. The early errors (21.2.1.1) are checked during
+     * parsing, except for the ones concerning backreferences, which are checked after the whole pattern is parsed
+     * (backreferences can point forward).
+     *
+     * All errors are reported via util::throw_error.
+     *
+     * The AST keeps views (zstring_view) into the pattern (group names, Unicode property names), so the pattern must
+     * outlive the AST.
      */
-    struct CharClassAtom {
-        bool is_escape;
-        Z3Char val;
-    };
-
-    using ASTNodeCharClassRef = std::unique_ptr<ASTNodeCharClass>;
-
     class ECMAParser {
     public:
-        explicit ECMAParser(const zstring_view regex)
-            : m_lexer(regex, m_named_groups),
-              m_current_token(m_lexer.get_next_token()) { }
+        explicit ECMAParser(const zstring_view pattern)
+            : m_pattern(pattern) { }
 
+        /**
+         * @brief Parse the whole Pattern and check its early errors.
+         *
+         * @return ASTNodeRef The root of the AST.
+         */
         ASTNodeRef parse();
 
+        /**
+         * @brief Return NcapturingParens, the number of capturing groups in the parsed pattern.
+         */
+        GroupID num_capturing_groups() const;
+
     private:
-        std::unordered_map<zstring_view, GroupID> m_named_groups {};
-        ECMALexer m_lexer;
-        Token m_current_token;
-        GroupID m_current_group_id = 0;
+        // Names are compared by their StringValue (21.2.1.6) -- the escape sequences are replaced, so the name can
+        // differ from the source text and it cannot be a view into the pattern.
+        struct NamedGroup {
+            zstring name;
+            GroupID gid;
+        };
 
-        void next();
-        bool match(TokenType type);
-        Token consume(TokenType type, const char* message);
+        // A backreference whose group is checked/resolved after the whole pattern is parsed.
+        struct PendingBackref {
+            ASTNodeBackreference* node;
+            std::size_t position;
+            zstring name;  // StringValue of the GroupName, empty for numeric backreferences
+        };
 
+        // The result of the ClassAtom production -- a single character or a character class escape.
+        struct ClassAtom {
+            bool is_class = false;
+            Z3Char value = 0;
+            CharClassEscape escape {};
+        };
+
+        zstring_view m_pattern;
+        std::size_t m_pos = 0;
+        GroupID m_num_capturing_groups = 0;
+        std::vector<NamedGroup> m_named_groups;
+        std::vector<PendingBackref> m_pending_backrefs;
+
+        // ---- reading the pattern ----
+        bool at_end() const;
+        Z3Char peek(std::size_t offset = 0) const;
+        Z3Char advance();
+        bool eat(Z3Char ch);
+        void expect(Z3Char ch, const char* what);
+        void syntax_error(const std::string& message, std::size_t position) const;
+        void syntax_error(const std::string& message) const;
+
+        // ---- grammar productions (21.2.1) ----
         ASTNodeRef parse_disjunction();
         ASTNodeRef parse_alternative();
         ASTNodeRef parse_term();
-        ASTNodeRef parse_maybe_quantifier(ASTNodeRef term);
-        ASTNodeRef parse_assertion();
+        ASTNodeRef try_parse_assertion();
+        bool try_parse_quantifier(Quantifier& quantifier);
+        uint64_t parse_decimal_digits(const char* what);
         ASTNodeRef parse_atom();
         ASTNodeRef parse_group();
+        ASTNodeRef parse_atom_escape();
+        Z3Char parse_character_escape();
+        bool try_parse_character_class_escape(CharClassEscape& escape);
+        void parse_unicode_property_value_expression(CharClassEscape& escape);
+        Z3Char parse_regexp_unicode_escape_sequence();
+        bool try_parse_hex4_digits(std::size_t offset, Z3Char& value) const;
+        zstring parse_group_name(zstring_view& source_text);
+        Z3Char parse_regexp_identifier_char(bool is_start);
         ASTNodeRef parse_character_class();
+        void parse_class_ranges(ASTNodeCharClass& char_class);
+        ClassAtom parse_class_atom();
+        ClassAtom parse_class_escape();
 
-        void parse_class_ranges(const ASTNodeCharClassRef& char_class_parent);
-        void parse_class_ranges_tail(const ASTNodeCharClassRef& char_class_parent, CharClassAtom prev_atom);
-        void parse_dash_tail(const ASTNodeCharClassRef& char_class, CharClassAtom atom_before_dash);
-        CharClassAtom parse_class_atom();
-        CharClassAtom parse_class_atom_no_dash();
-
-        static void add_atom_to_class(const ASTNodeCharClassRef& char_class_parent, CharClassAtom atom);
+        // ---- capturing groups and backreferences ----
+        GroupID create_capturing_group();
+        void register_group_name(const zstring& name, GroupID gid, std::size_t position);
+        void resolve_backreferences();
     };
 
     // ================= DFS CONTEXT CLASSES ==================
@@ -1026,13 +1044,15 @@ namespace smt::noodler::ecma {
          * @brief Build the Regex Constraint Graph (RCG) from the regex pattern.
          *
          * Parses the regex, calls get_subgraph() on the root AST node to obtain the core
-         * subgraph (or a single app_ref for a fully regular regex), then wraps it:
+         * subgraph (or a single app_ref for a fully regular regex). If the parameter `str.ecma_engine_semantics` is
+         * set, the core subgraph is wrapped:
          *
          *   start_vertex --(Sigma*)--> core_v_in
          *                              ...core subgraph...
          *                              core_v_out --(Sigma*)--> end_vertex
          *
-         * The Sigma* edges model the regex engine matching semantics -- any substring can be matched.
+         * The Sigma* edges model the regex engine matching semantics -- any substring can be matched. Otherwise, the
+         * whole string must match the regex.
          *
          * @return RegexConstraintGraph The fully assembled RCG.
          */

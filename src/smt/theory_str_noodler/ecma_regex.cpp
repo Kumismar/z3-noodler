@@ -1,18 +1,20 @@
 #include "ecma_regex.h"
 
 #include "ast/ast.h"
-#include "ast/expr_abstract.h"
 #include "ast/seq_decl_plugin.h"
 #include "util.h"
 #include "util/debug.h"
 #include "util/zstring_view.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -20,107 +22,272 @@
 
 namespace smt::noodler::ecma {
     // ======================= UTILS =======================
-    constexpr uint32_t HEX_SEQUENCE_LEN = 2;
-    constexpr uint32_t UNICODE_ESCAPE_SEQUENCE_LEN = 4;
-    constexpr Z3Char BACKSPACE_LITERAL = 8;
-    constexpr uint64_t UNBOUNDED = std::numeric_limits<uint64_t>::max();
     constexpr bool debug_mode = false;
 
-    constexpr Z3Char CH_HT = 0x0009;      // Horizontal Tab
-    constexpr Z3Char CH_VT = 0x000B;      // Vertical Tab
-    constexpr Z3Char CH_FF = 0x000C;      // Form Feed
-    constexpr Z3Char CH_SP = 0x0020;      // Space
-    constexpr Z3Char CH_NBSP = 0x00A0;    // Non-Breaking Space
-    constexpr Z3Char CH_ZWNBSP = 0xFEFF;  // Zero Width Non-Breaking Space (BOM)
-    constexpr Z3Char CH_US = 0x001F;      // Unit Separator
-    constexpr Z3Char CH_LF = 0x000A;      // Line Feed
-    constexpr Z3Char CH_CR = 0x000D;      // Carriage Return
-    constexpr Z3Char CH_LS = 0x2028;      // Line Separator
-    constexpr Z3Char CH_PS = 0x2029;      // Paragraph Separator
+    // Line terminators (ECMA-262 2020, 11.3 Line Terminators, Table 33)
+    constexpr Z3Char CH_LF = 0x000A;  // Line Feed
+    constexpr Z3Char CH_CR = 0x000D;  // Carriage Return
+    constexpr Z3Char CH_LS = 0x2028;  // Line Separator
+    constexpr Z3Char CH_PS = 0x2029;  // Paragraph Separator
+
+    constexpr Z3Char CH_BACKSPACE = 0x0008;
+    constexpr Z3Char CH_ZWNJ = 0x200C;  // Zero Width Non-Joiner
+    constexpr Z3Char CH_ZWJ = 0x200D;   // Zero Width Joiner
+    constexpr Z3Char CH_REPLACEMENT = 0xFFFD;
+    constexpr Z3Char MAX_CODE_POINT = 0x10FFFF;
+
+    // Characters matched by \s: WhiteSpace (11.2, Table 32, including the "Zs" category) and LineTerminator (11.3,
+    // Table 33), see 21.2.2.12 CharacterClassEscape. Stored as inclusive ranges.
+    constexpr std::array<ClassRange, 10> WHITESPACE_RANGES {{
+        {0x0009, 0x000D},  // <TAB>, <LF>, <VT>, <FF>, <CR>
+        {0x0020, 0x0020},  // <SP>
+        {0x00A0, 0x00A0},  // <NBSP>
+        {0x1680, 0x1680},  // Zs: OGHAM SPACE MARK
+        {0x2000, 0x200A},  // Zs: EN QUAD .. HAIR SPACE
+        {0x2028, 0x2029},  // <LS>, <PS>
+        {0x202F, 0x202F},  // Zs: NARROW NO-BREAK SPACE
+        {0x205F, 0x205F},  // Zs: MEDIUM MATHEMATICAL SPACE
+        {0x3000, 0x3000},  // Zs: IDEOGRAPHIC SPACE
+        {0xFEFF, 0xFEFF},  // <ZWNBSP>
+    }};
+
+    // Unicode property names and values allowed in \p{...} and \P{...} (ECMA-262 2020, 21.2.2.8.3 and 21.2.2.8.4).
+    // Table 55: Non-binary Unicode property aliases
+    constexpr std::array<const char*, 2> PROPERTY_GENERAL_CATEGORY {"General_Category", "gc"};
+    constexpr std::array<const char*, 4> PROPERTY_SCRIPT {"Script", "sc", "Script_Extensions", "scx"};
+
+    // Table 56: Binary Unicode property aliases
+    constexpr std::array<const char*, 93> BINARY_PROPERTIES {
+        "ASCII", "ASCII_Hex_Digit", "AHex", "Alphabetic", "Alpha", "Any", "Assigned", "Bidi_Control", "Bidi_C",
+        "Bidi_Mirrored", "Bidi_M", "Case_Ignorable", "CI", "Cased", "Changes_When_Casefolded", "CWCF",
+        "Changes_When_Casemapped", "CWCM", "Changes_When_Lowercased", "CWL", "Changes_When_NFKC_Casefolded", "CWKCF",
+        "Changes_When_Titlecased", "CWT", "Changes_When_Uppercased", "CWU", "Dash", "Default_Ignorable_Code_Point",
+        "DI", "Deprecated", "Dep", "Diacritic", "Dia", "Emoji", "Emoji_Component", "Emoji_Modifier",
+        "Emoji_Modifier_Base", "Emoji_Presentation", "Extended_Pictographic", "Extender", "Ext", "Grapheme_Base",
+        "Gr_Base", "Grapheme_Extend", "Gr_Ext", "Hex_Digit", "Hex", "IDS_Binary_Operator", "IDSB",
+        "IDS_Trinary_Operator", "IDST", "ID_Continue", "IDC", "ID_Start", "IDS", "Ideographic", "Ideo",
+        "Join_Control", "Join_C", "Logical_Order_Exception", "LOE", "Lowercase", "Lower", "Math",
+        "Noncharacter_Code_Point", "NChar", "Pattern_Syntax", "Pat_Syn", "Pattern_White_Space", "Pat_WS",
+        "Quotation_Mark", "QMark", "Radical", "Regional_Indicator", "RI", "Sentence_Terminal", "STerm", "Soft_Dotted",
+        "SD", "Terminal_Punctuation", "Term", "Unified_Ideograph", "UIdeo", "Uppercase", "Upper", "Variation_Selector",
+        "VS", "White_Space", "space", "XID_Continue", "XIDC", "XID_Start", "XIDS"};
+
+    // Table 57: Value aliases and canonical values for the Unicode property General_Category
+    constexpr std::array<const char*, 80> GENERAL_CATEGORY_VALUES {
+        "Cased_Letter", "LC", "Close_Punctuation", "Pe", "Connector_Punctuation", "Pc", "Control", "Cc", "cntrl",
+        "Currency_Symbol", "Sc", "Dash_Punctuation", "Pd", "Decimal_Number", "Nd", "digit", "Enclosing_Mark", "Me",
+        "Final_Punctuation", "Pf", "Format", "Cf", "Initial_Punctuation", "Pi", "Letter", "L", "Letter_Number", "Nl",
+        "Line_Separator", "Zl", "Lowercase_Letter", "Ll", "Mark", "M", "Combining_Mark", "Math_Symbol", "Sm",
+        "Modifier_Letter", "Lm", "Modifier_Symbol", "Sk", "Nonspacing_Mark", "Mn", "Number", "N", "Open_Punctuation",
+        "Ps", "Other", "C", "Other_Letter", "Lo", "Other_Number", "No", "Other_Punctuation", "Po", "Other_Symbol", "So",
+        "Paragraph_Separator", "Zp", "Private_Use", "Co", "Punctuation", "P", "punct", "Separator", "Z",
+        "Space_Separator", "Zs", "Spacing_Mark", "Mc", "Surrogate", "Cs", "Symbol", "S", "Titlecase_Letter", "Lt",
+        "Unassigned", "Cn", "Uppercase_Letter", "Lu"};
+
+    // Table 58: Value aliases and canonical values for the Unicode properties Script and Script_Extensions
+    constexpr std::array<const char*, 300> SCRIPT_VALUES {
+        "Adlam", "Adlm", "Ahom", "Anatolian_Hieroglyphs", "Hluw", "Arabic", "Arab", "Armenian", "Armn", "Avestan",
+        "Avst", "Balinese", "Bali", "Bamum", "Bamu", "Bassa_Vah", "Bass", "Batak", "Batk", "Bengali", "Beng",
+        "Bhaiksuki", "Bhks", "Bopomofo", "Bopo", "Brahmi", "Brah", "Braille", "Brai", "Buginese", "Bugi", "Buhid",
+        "Buhd", "Canadian_Aboriginal", "Cans", "Carian", "Cari", "Caucasian_Albanian", "Aghb", "Chakma", "Cakm", "Cham",
+        "Cherokee", "Cher", "Common", "Zyyy", "Coptic", "Copt", "Qaac", "Cuneiform", "Xsux", "Cypriot", "Cprt",
+        "Cyrillic", "Cyrl", "Deseret", "Dsrt", "Devanagari", "Deva", "Dogra", "Dogr", "Duployan", "Dupl",
+        "Egyptian_Hieroglyphs", "Egyp", "Elbasan", "Elba", "Elymaic", "Elym", "Ethiopic", "Ethi", "Georgian", "Geor",
+        "Glagolitic", "Glag", "Gothic", "Goth", "Grantha", "Gran", "Greek", "Grek", "Gujarati", "Gujr", "Gunjala_Gondi",
+        "Gong", "Gurmukhi", "Guru", "Han", "Hani", "Hangul", "Hang", "Hanifi_Rohingya", "Rohg", "Hanunoo", "Hano",
+        "Hatran", "Hatr", "Hebrew", "Hebr", "Hiragana", "Hira", "Imperial_Aramaic", "Armi", "Inherited", "Zinh", "Qaai",
+        "Inscriptional_Pahlavi", "Phli", "Inscriptional_Parthian", "Prti", "Javanese", "Java", "Kaithi", "Kthi",
+        "Kannada", "Knda", "Katakana", "Kana", "Kayah_Li", "Kali", "Kharoshthi", "Khar", "Khmer", "Khmr", "Khojki",
+        "Khoj", "Khudawadi", "Sind", "Lao", "Laoo", "Latin", "Latn", "Lepcha", "Lepc", "Limbu", "Limb", "Linear_A",
+        "Lina", "Linear_B", "Linb", "Lisu", "Lycian", "Lyci", "Lydian", "Lydi", "Mahajani", "Mahj", "Makasar", "Maka",
+        "Malayalam", "Mlym", "Mandaic", "Mand", "Manichaean", "Mani", "Marchen", "Marc", "Medefaidrin", "Medf",
+        "Masaram_Gondi", "Gonm", "Meetei_Mayek", "Mtei", "Mende_Kikakui", "Mend", "Meroitic_Cursive", "Merc",
+        "Meroitic_Hieroglyphs", "Mero", "Miao", "Plrd", "Modi", "Mongolian", "Mong", "Mro", "Mroo", "Multani", "Mult",
+        "Myanmar", "Mymr", "Nabataean", "Nbat", "Nandinagari", "Nand", "New_Tai_Lue", "Talu", "Newa", "Nko", "Nkoo",
+        "Nushu", "Nshu", "Nyiakeng_Puachue_Hmong", "Hmnp", "Ogham", "Ogam", "Ol_Chiki", "Olck", "Old_Hungarian", "Hung",
+        "Old_Italic", "Ital", "Old_North_Arabian", "Narb", "Old_Permic", "Perm", "Old_Persian", "Xpeo", "Old_Sogdian",
+        "Sogo", "Old_South_Arabian", "Sarb", "Old_Turkic", "Orkh", "Oriya", "Orya", "Osage", "Osge", "Osmanya", "Osma",
+        "Pahawh_Hmong", "Hmng", "Palmyrene", "Palm", "Pau_Cin_Hau", "Pauc", "Phags_Pa", "Phag", "Phoenician", "Phnx",
+        "Psalter_Pahlavi", "Phlp", "Rejang", "Rjng", "Runic", "Runr", "Samaritan", "Samr", "Saurashtra", "Saur",
+        "Sharada", "Shrd", "Shavian", "Shaw", "Siddham", "Sidd", "SignWriting", "Sgnw", "Sinhala", "Sinh", "Sogdian",
+        "Sogd", "Sora_Sompeng", "Sora", "Soyombo", "Soyo", "Sundanese", "Sund", "Syloti_Nagri", "Sylo", "Syriac", "Syrc",
+        "Tagalog", "Tglg", "Tagbanwa", "Tagb", "Tai_Le", "Tale", "Tai_Tham", "Lana", "Tai_Viet", "Tavt", "Takri", "Takr",
+        "Tamil", "Taml", "Tangut", "Tang", "Telugu", "Telu", "Thaana", "Thaa", "Thai", "Tibetan", "Tibt", "Tifinagh",
+        "Tfng", "Tirhuta", "Tirh", "Ugaritic", "Ugar", "Vai", "Vaii", "Wancho", "Wcho", "Warang_Citi", "Wara", "Yi",
+        "Yiii", "Zanabazar_Square", "Zanb"};
+
+    // Compares @p str with the ASCII string @p ascii.
+    static bool equals_ascii(const zstring_view str, const char* ascii) {
+        uint32_t i = 0;
+        for (; ascii[i] != '\0'; i++) {
+            if (i >= str.length() || str[i] != static_cast<unsigned char>(ascii[i])) {
+                return false;
+            }
+        }
+        return i == str.length();
+    }
+
+    template <std::size_t N>
+    static bool contains_name(const std::array<const char*, N>& names, const zstring_view name) {
+        return std::any_of(names.begin(), names.end(), [&](const char* candidate) {
+            return equals_ascii(name, candidate);
+        });
+    }
+
+    static bool is_decimal_digit(const Z3Char ch) {
+        return ch >= '0' && ch <= '9';
+    }
+
+    static bool is_hex_digit(const Z3Char ch) {
+        return is_decimal_digit(ch) || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+    }
+
+    static uint32_t hex_digit_value(const Z3Char ch) {
+        if (is_decimal_digit(ch)) {
+            return ch - '0';
+        }
+        if (ch >= 'a' && ch <= 'f') {
+            return ch - 'a' + 10;
+        }
+        return ch - 'A' + 10;
+    }
+
+    static bool is_ascii_letter(const Z3Char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+    }
+
+    // SyntaxCharacter :: one of ^ $ \ . * + ? ( ) [ ] { } |   (21.2.1)
+    static bool is_syntax_character(const Z3Char ch) {
+        switch (ch) {
+            case '^':
+            case '$':
+            case '\\':
+            case '.':
+            case '*':
+            case '+':
+            case '?':
+            case '(':
+            case ')':
+            case '[':
+            case ']':
+            case '{':
+            case '}':
+            case '|':
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static bool is_lead_surrogate(const Z3Char ch) {
+        return ch >= 0xD800 && ch <= 0xDBFF;
+    }
+
+    static bool is_trail_surrogate(const Z3Char ch) {
+        return ch >= 0xDC00 && ch <= 0xDFFF;
+    }
+
+    // Printable ASCII characters are printed quoted ('a'), all other characters as U+XXXX.
+    static std::string char_to_string(const Z3Char ch) {
+        if (ch >= 0x20 && ch <= 0x7E) {
+            return std::string("'") + static_cast<char>(ch) + "'";
+        }
+        std::ostringstream out;
+        out << "U+" << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << ch;
+        return out.str();
+    }
+
+    static zstring char_to_zstring(const Z3Char ch) {
+        return zstring(char_to_string(ch).c_str());
+    }
+
+    // Characters above the maximal character of the current string encoding cannot be represented in Z3.
+    static void check_representable_char(const Z3Char ch, const seq_util& util_s) {
+        if (ch > util_s.max_char()) {
+            util::throw_error("ECMA regex unsupported: character " + char_to_string(ch) +
+                              " is above the maximal character supported by the string encoding");
+        }
+    }
+
+    // Sigma \ chars, i.e., all characters except the ones matched by @p chars.
+    static app* mk_char_complement(seq_util& util_s, app* chars) {
+        return util_s.re.mk_inter(util_s.re.mk_full_char(nullptr), util_s.re.mk_complement(chars));
+    }
 
     zstring sanitize_ecma_regex_input(const zstring& raw_input) {
-        std::ostringstream sanitized;
+        std::vector<unsigned> sanitized;
+        sanitized.reserve(raw_input.length());
 
-        auto is_continuation = [&](uint32_t idx) -> bool {
-            bool is_raw_byte = raw_input[idx] <= 0xFF;
-            bool is_continuation_byte = (raw_input[idx] & 0xC0) == 0x80;  // top two bits must be 10xxxxxx
-            return idx < raw_input.length() && is_raw_byte && is_continuation_byte;
-        };
-
-        // Unicode replacement character -- used when invalid byte is encountered
-        auto insert_unicode_replacement = [&]() {
-            sanitized << "\\u{fffd}";
+        auto is_continuation = [&](const uint32_t idx) -> bool {
+            if (idx >= raw_input.length()) {
+                return false;
+            }
+            const bool is_raw_byte = raw_input[idx] <= 0xFF;
+            const bool is_continuation_byte = (raw_input[idx] & 0xC0) == 0x80;  // top two bits must be 10xxxxxx
+            return is_raw_byte && is_continuation_byte;
         };
 
         uint32_t i = 0;
         while (i < raw_input.length()) {
-            Z3Char raw_char = raw_input[i];
+            const Z3Char raw_char = raw_input[i];
 
             // If the character value is > 0xFF, the zstring constructor already parsed it into a valid Unicode code
-            // point --> skip this. Originally, the character was in form \uXXXX or similar.
+            // point. Originally, the character was in form \u{XXXX} or similar in the SMT-LIB string literal.
             if (raw_char > 0xFF) {
-                sanitized << "\\u{" << std::hex << raw_char << std::dec << "}";
+                sanitized.push_back(raw_char);
                 i++;
                 continue;
             }
 
             if (raw_char < 0x80) {
                 // 0xxxxxxx (1 byte)
-                sanitized << static_cast<char>(raw_char);
+                sanitized.push_back(raw_char);
                 i++;
             } else if ((raw_char & 0xE0) == 0xC0) {
                 // 110xxxxx 10xxxxxx (2 bytes)
                 if (!is_continuation(i + 1)) {
-                    insert_unicode_replacement();
+                    sanitized.push_back(CH_REPLACEMENT);
                     i++;
                     continue;
                 }
-                Z3Char code_point = ((raw_char & 0x1F) << 6) | (raw_input[i + 1] & 0x3F);
-                if (code_point < 0x80) {
-                    insert_unicode_replacement();
-                    i += 2;
-                    continue;
-                }
-                sanitized << "\\u{" << std::hex << code_point << std::dec << "}";
+                const Z3Char code_point = ((raw_char & 0x1F) << 6) | (raw_input[i + 1] & 0x3F);
+                sanitized.push_back(code_point < 0x80 ? CH_REPLACEMENT : code_point);
                 i += 2;
             } else if ((raw_char & 0xF0) == 0xE0) {
                 // 1110xxxx 10xxxxxx 10xxxxxx (3 bytes)
                 if (!is_continuation(i + 1) || !is_continuation(i + 2)) {
-                    insert_unicode_replacement();
+                    sanitized.push_back(CH_REPLACEMENT);
                     i++;
                     continue;
                 }
-                Z3Char code_point =
+                const Z3Char code_point =
                     ((raw_char & 0x0F) << 12) | ((raw_input[i + 1] & 0x3F) << 6) | (raw_input[i + 2] & 0x3F);
-                if (code_point < 0x800 || (code_point >= 0xD800 && code_point <= 0xDFFF)) {
-                    insert_unicode_replacement();
-                    i += 3;
-                    continue;
-                }
-                sanitized << "\\u{" << std::hex << code_point << std::dec << "}";
+                const bool is_invalid = code_point < 0x800 || (code_point >= 0xD800 && code_point <= 0xDFFF);
+                sanitized.push_back(is_invalid ? CH_REPLACEMENT : code_point);
                 i += 3;
             } else if ((raw_char & 0xF8) == 0xF0) {
                 // 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx (4 bytes)
                 if (!is_continuation(i + 1) || !is_continuation(i + 2) || !is_continuation(i + 3)) {
-                    insert_unicode_replacement();
+                    sanitized.push_back(CH_REPLACEMENT);
                     i++;
                     continue;
                 }
-                Z3Char code_point = ((raw_char & 0x07) << 18) | ((raw_input[i + 1] & 0x3F) << 12) |
-                                    ((raw_input[i + 2] & 0x3F) << 6) | (raw_input[i + 3] & 0x3F);
-                if (code_point < 0x10000 || code_point > 0x10FFFF) {
-                    insert_unicode_replacement();
-                    i += 4;
-                    continue;
-                }
-                sanitized << "\\u{" << std::hex << code_point << std::dec << "}";
+                const Z3Char code_point = ((raw_char & 0x07) << 18) | ((raw_input[i + 1] & 0x3F) << 12) |
+                                          ((raw_input[i + 2] & 0x3F) << 6) | (raw_input[i + 3] & 0x3F);
+                const bool is_invalid = code_point < 0x10000 || code_point > MAX_CODE_POINT;
+                sanitized.push_back(is_invalid ? CH_REPLACEMENT : code_point);
                 i += 4;
             } else {
-                insert_unicode_replacement();
+                sanitized.push_back(CH_REPLACEMENT);
                 i++;
             }
+
+            if (sanitized.back() > zstring::max_char()) {
+                util::throw_error("ECMA regex unsupported: character " + char_to_string(sanitized.back()) +
+                                  " is above the maximal character supported by the string encoding");
+            }
         }
-        return zstring(sanitized.str().c_str());
+        return {static_cast<unsigned>(sanitized.size()), sanitized.data()};
     }
 
     GraphFragment chain_fragments(RegexConstraintGraph& graph, const GraphFragment& first,
@@ -203,669 +370,10 @@ namespace smt::noodler::ecma {
         return new_id;
     }
 
-    // ================= ECMA REGEX LEXER ===================
-
-    Token ECMALexer::get_next_token() {
-        if (m_first_traverse) {
-            perform_first_traverse();
-            m_first_traverse = false;
-        }
-
-        if (m_position >= m_regex.length()) {
-            return {TokenType::END_OF_INPUT, {}, zstring_view(nullptr, 0)};
-        }
-
-        m_lexeme_start_pos = m_position;
-
-        if (m_in_char_class) {
-            return get_token_char_class();
-        }
-        return get_token_standard();
-    }
-
-    bool ECMALexer::is_digit(const Z3Char digit) {
-        return digit >= '0' && digit <= '9';
-    }
-
-    bool ECMALexer::is_alpha(const Z3Char digit) {
-        return (digit >= 'A' && digit <= 'Z') || (digit >= 'a' && digit <= 'z');
-    }
-
-    bool ECMALexer::is_alnum(const Z3Char digit) {
-        return is_alpha(digit) || is_digit(digit);
-    }
-
-    bool ECMALexer::is_hex_digit(const Z3Char digit) {
-        return is_digit(digit) || (digit >= 'A' && digit <= 'F') || (digit >= 'a' && digit <= 'f');
-    }
-
-    bool ECMALexer::is_octal_digit(const Z3Char digit) {
-        return digit >= '0' && digit <= '7';
-    }
-
-    bool ECMALexer::is_upper(const Z3Char digit) {
-        return digit >= 'A' && digit <= 'Z';
-    }
-
-    uint32_t ECMALexer::alphabet_rank(const Z3Char digit) {
-        if (is_upper(digit)) {
-            return digit - 'A' + 1;
-        }
-        return digit - 'a' + 1;
-    }
-
-    Z3Char ECMALexer::hex2char(const zstring_view number) {
-        Z3Char res = 0;
-        for (uint32_t pos = 0; pos < number.length(); pos++) {
-            const Z3Char hex_digit = number[pos];
-            if (hex_digit >= '0' && hex_digit <= '9') {
-                res = res * 16 + (hex_digit - '0');
-            } else if (hex_digit >= 'A' && hex_digit <= 'F') {
-                res = res * 16 + (hex_digit - 'A' + 10);
-            } else {
-                res = res * 16 + (hex_digit - 'a' + 10);
-            }
-        }
-        return res;
-    }
-
-    Z3Char ECMALexer::oct2char(const zstring_view number) {
-        Z3Char res = 0;
-        for (uint32_t pos = 0; pos < number.length(); pos++) {
-            const Z3Char digit = number[pos];
-            if (is_octal_digit(digit)) {
-                res = res * 8 + (digit - '0');
-            }
-        }
-        return res;
-    }
-
-    Token ECMALexer::make_token(const TokenType type, const TokenPayload& payload) const {
-        const uint32_t len = m_position - m_lexeme_start_pos;
-        return {type, payload, zstring_view(&m_regex[m_lexeme_start_pos], len)};
-    }
-
-    Token ECMALexer::get_hex_escape_seq_token() {
-        // hexadecimal escape sequence in format \xHH
-        // currently m_position is right after '\x' -- hence the 1
-        if (m_position + 1 >= m_regex.length()) {
-            m_position = m_lexeme_start_pos + 2;  // rollback to skip just '\x'
-            return make_token(TokenType::LITERAL, static_cast<Z3Char>('x'));
-        }
-
-        const Z3Char first_hex_digit = m_regex[m_position];
-        const Z3Char second_hex_digit = m_regex[m_position + 1];
-
-        // if the hex number is not well-formed, then '\x' is a literal 'x' and the rest is parsed separately
-        if (!is_hex_digit(first_hex_digit) || !is_hex_digit(second_hex_digit)) {
-            m_position = m_lexeme_start_pos + 2;  // rollback to skip just '\x'
-            return make_token(TokenType::LITERAL, static_cast<Z3Char>('x'));
-        }
-
-        // get decimal value of hex digits after '\x'
-        Z3Char hex_val = hex2char(zstring_view(&m_regex[m_lexeme_start_pos + 2], HEX_SEQUENCE_LEN));
-        m_position += 2;  // consume both hex digits
-        return make_token(TokenType::LITERAL, hex_val);
-    }
-
-    Token ECMALexer::get_unicode_escape_seq_token() {
-        // unicode escape sequence in format \uHHHH
-        // currently m_position is on the first hex digit right after '\u' -- hence the 3
-        if (m_position + 3 >= m_regex.length()) {
-            m_position = m_lexeme_start_pos + 2;  // rollback to skip just '\u'
-            return make_token(TokenType::LITERAL, static_cast<Z3Char>('u'));
-        }
-
-        for (uint32_t i = 0; i < UNICODE_ESCAPE_SEQUENCE_LEN; i++) {
-            const Z3Char current_char = m_regex[m_position + i];
-            if (!is_hex_digit(current_char)) {
-                m_position = m_lexeme_start_pos + 2;  // rollback to skip just '\u'
-                return make_token(TokenType::LITERAL, static_cast<Z3Char>('u'));
-            }
-        }
-
-        util::throw_error(
-            "How did we get here? The zstring constructor should have parsed the unicode sequence for us");
-        // return dummy token, because compilation errors with return type (execution wont get here)
-        return {};
-    }
-
-    Token ECMALexer::get_control_escape_seq_token() {
-        // control escape sequence in format \cC, where C is a control character
-        // Currently m_position is right after '\c'
-        if (m_position >= m_regex.length()) {
-            util::throw_error("Syntax error in ECMA regex: Invalid control sequence" + std::string("\\c"));
-        }
-
-        const Z3Char control_char = m_regex[m_position];
-        m_position++;  // consume the control character
-
-        // [A-Za-z] characters allowed, otherwise error
-        if (!is_alpha(control_char)) {
-            util::throw_error("Syntax error in ECMA regex: Invalid control sequence" + std::string("\\c"));
-        }
-        return make_token(TokenType::LITERAL, alphabet_rank(control_char));
-    }
-
-    uint32_t ECMALexer::get_backref_name_len(const uint32_t name_start_pos) const {
-        bool found_closing_bracket = false;
-        std::size_t name_length = 0;
-        for (std::size_t pos = name_start_pos; pos < m_regex.length(); pos++) {
-            const Z3Char current_name_char = m_regex[pos];
-            if (current_name_char == '>') {
-                found_closing_bracket = true;
-                break;
-            }
-            if (!is_alnum(current_name_char) && current_name_char != '_' && current_name_char != '$') {
-                util::throw_error("ECMA regex syntax error: Invalid character in back reference name");
-            }
-            name_length++;
-        }
-
-        if (!found_closing_bracket) {
-            util::throw_error("ECMA regex syntax error: Unclosed back reference name at the end of regex");
-        }
-        if (name_length == 0) {
-            util::throw_error("ECMA regex syntax error: Empty back reference name");
-        }
-        return name_length;
-    }
-
-    Token ECMALexer::get_named_backref_token() {
-        // '\k<name>'
-        // currently at '<' after '\k'
-        if (m_position >= m_regex.length()) {
-            util::throw_error("ECMA regex syntax error: Invalid named backreference at the end of regex");
-        }
-
-        const Z3Char open_bracket_char = m_regex[m_position];
-        if (open_bracket_char != '<') {
-            util::throw_error("ECMA regex syntax error: Missing '<' in named backreference");
-        }
-
-        m_position++;  // consume '<'
-        const uint32_t name_start_pos = m_position;
-        const uint32_t name_length = get_backref_name_len(name_start_pos);
-        m_position += name_length + 1;  // consume name and '>'
-
-        const zstring_view backref_name {&m_regex[name_start_pos], name_length};
-        auto it = m_named_groups.find(backref_name);
-        if (it == m_named_groups.end()) {
-            util::throw_error("ECMA regex syntax error: Backreference to undefined named group");
-        }
-        return make_token(TokenType::BACKREFERENCE, it->second);
-    }
-
-    Token ECMALexer::octal_or_backref(const Z3Char first_digit) {
-        Z3Char decimal_val = first_digit - '0';
-        const uint32_t fallback_pos = m_position;  // save position right after the first digit
-
-        // greedily read as much digits as possible
-        while (m_position < m_regex.length()) {
-            const Z3Char digit = m_regex[m_position];
-            if (!is_digit(digit)) {
-                break;
-            }
-            decimal_val = decimal_val * 10 + (digit - '0');
-            m_position++;
-        }
-
-        // try to match it to a backreference
-        if (decimal_val > 0 && decimal_val <= m_num_capture_groups) {
-            return make_token(TokenType::BACKREFERENCE, decimal_val);
-        }
-
-        // cannot be backreference --> match the input to an octal escape sequence
-        m_position = fallback_pos;  // fallback to after the first digit
-        return get_octal_escape_sequence_token(false, first_digit);
-    }
-
-    Token ECMALexer::get_octal_escape_sequence_token(const bool from_char_class, const Z3Char first_digit) {
-        // m_position is right after first_digit. m_lexeme_start_pos is at '\'
-        uint32_t max_possible_octal_len = 3;
-
-        if (!from_char_class && (first_digit == '8' || first_digit == '9')) {
-            util::throw_error("ECMA regex syntax error: backreference to nonexistent subpattern");
-        }
-
-        if (first_digit > '3') {
-            max_possible_octal_len = 2;
-        }
-
-        uint32_t real_octal_len = 1;  // already parsed the first digit
-        while (real_octal_len < max_possible_octal_len && m_position < m_regex.length()) {
-            const Z3Char digit = m_regex[m_position];
-            if (!is_octal_digit(digit)) {
-                break;
-            }
-            m_position++;
-            real_octal_len++;
-        }
-
-        // Octal string starts at m_lexeme_start_pos + 1 (skipping '\')
-        Z3Char octal_val = oct2char(zstring_view(&m_regex[m_lexeme_start_pos + 1], real_octal_len));
-        return make_token(TokenType::LITERAL, octal_val);
-    }
-
-    Token ECMALexer::get_named_capture_group_token() {
-        // called right after '(?<'
-        uint32_t name_length = 0;
-        const uint32_t group_name_start_pos = m_position;
-        bool found_closing_bracket = false;
-
-        while (m_position < m_regex.length()) {
-            const Z3Char current_char = m_regex[m_position];
-            m_position++;
-
-            if (current_char == '>') {
-                found_closing_bracket = true;
-                break;
-            }
-            if (!is_alnum(current_char) && current_char != '_' && current_char != '$') {
-                util::throw_error("ECMA regex syntax error: Invalid character in capture group name");
-            }
-            name_length++;
-        }
-        if (!found_closing_bracket) {
-            util::throw_error("ECMA regex syntax error: Unclosed group capture name");
-        }
-        if (name_length == 0) {
-            util::throw_error("ECMA regex syntax error: Empty group name");
-        }
-        // payload is just the name of the group, lexeme is the whole '(?<name>' thing
-        return make_token(TokenType::GROUP_NAMED_START, zstring_view(&m_regex[group_name_start_pos], name_length));
-    }
-
-    uint32_t ECMALexer::validate_and_get_bound(uint64_t& bound_value) {
-        uint32_t parsed_digits = 0;
-        while (m_position < m_regex.length()) {
-            const Z3Char current_digit = m_regex[m_position];
-            if (!is_digit(current_digit)) {
-                break;
-            }
-            bound_value = bound_value * 10 + static_cast<uint64_t>(current_digit - '0');
-            m_position++;
-            parsed_digits++;
-        }
-        return parsed_digits;
-    }
-
-    Token ECMALexer::get_braced_quant_token() {
-        // already have '{' consumed -> check range of quantifier
-        uint64_t lower_bound = 0;
-        uint32_t bound_digits = validate_and_get_bound(lower_bound);
-
-        if (bound_digits == 0 || m_position >= m_regex.length()) {
-            m_position = m_lexeme_start_pos + 1;  // rollback to skip only '{'
-            return make_token(TokenType::LITERAL, static_cast<Z3Char>('{'));
-        }
-
-        // case '{n}'
-        if (m_regex[m_position] == '}') {
-            m_position++;  // consume '}'
-            if (m_regex[m_position] == '?') {
-                // skip lazy quantifier
-                m_position++;
-            }
-            return make_token(TokenType::QUANTIFIER, QuantifierRange {lower_bound, lower_bound});
-        }
-
-        if (m_regex[m_position] != ',') {
-            m_position = m_lexeme_start_pos + 1;  // rollback to skip only '{'
-            return make_token(TokenType::LITERAL, static_cast<Z3Char>('{'));
-        }
-
-        m_position++;  // skip comma
-        if (m_position >= m_regex.length()) {
-            m_position = m_lexeme_start_pos + 1;  // rollback to skip only '{'
-            return make_token(TokenType::LITERAL, static_cast<Z3Char>('{'));
-        }
-
-        // case '{n,}'
-        if (m_regex[m_position] == '}') {
-            m_position++;  // consume '}'
-            if (m_regex[m_position] == '?') {
-                // skip lazy quantifier
-                m_position++;
-            }
-            return make_token(TokenType::QUANTIFIER, QuantifierRange {lower_bound, UNBOUNDED});
-        }
-
-        uint64_t upper_bound = 0;
-        bound_digits = validate_and_get_bound(upper_bound);
-
-        if (bound_digits == 0 || m_position >= m_regex.length()) {
-            m_position = m_lexeme_start_pos + 1;  // rollback to skip only '{'
-            return make_token(TokenType::LITERAL, static_cast<Z3Char>('{'));
-        }
-
-        // '}' after number -> case {n,m}
-        if (m_regex[m_position] == '}') {
-            m_position++;  // consume '}'
-            if (m_regex[m_position] == '?') {
-                m_position++;
-            }
-            return make_token(TokenType::QUANTIFIER, QuantifierRange {lower_bound, upper_bound});
-        }
-
-        // not a well-formed quantifier --> '{' is a literal
-        m_position = m_lexeme_start_pos + 1;  // rollback to skip only '{'
-        return make_token(TokenType::LITERAL, static_cast<Z3Char>('{'));
-    }
-
-    Token ECMALexer::get_lookbehind_or_named_group_token() {
-        // called right after '(?<'
-        if (m_position >= m_regex.length()) {
-            util::throw_error("ECMA regex syntax error: Unfinished sequence '(?<'");
-        }
-
-        const Z3Char fourth_char = m_regex[m_position];
-        m_position++;  // consume the '=' or '!'
-
-        if (fourth_char == '=') {
-            return make_token(TokenType::LOOKBEHIND_POS_START);
-        }
-        if (fourth_char == '!') {
-            return make_token(TokenType::LOOKBEHIND_NEG_START);
-        }
-
-        // not '!' or '=' --> has to be named capture group (?<name>)
-        // we consumed the first letter of the name --> step back
-        m_position--;
-        return get_named_capture_group_token();
-    }
-
-    Token ECMALexer::get_special_group_or_lookaround_token() {
-        // called right after '(?'
-        if (m_position >= m_regex.length()) {
-            util::throw_error("ECMA regex syntax error: Unfinished sequence '(?' at the end of regex");
-        }
-
-        const Z3Char third_char = m_regex[m_position];
-        m_position++;
-        switch (third_char) {
-            case ':':
-                return make_token(TokenType::GROUP_NONCAPTURE_START);
-            case '=':
-                return make_token(TokenType::LOOKAHEAD_POS_START);
-            case '!':
-                return make_token(TokenType::LOOKAHEAD_NEG_START);
-            case '<':
-                return get_lookbehind_or_named_group_token();
-            default:
-                util::throw_error("ECMA regex syntax error: Invalid group indentifier");
-                return {};
-        }
-    }
-
-    Token ECMALexer::get_group_token() {
-        // called right after '('
-        if (m_position >= m_regex.length() || m_regex[m_position] != '?') {
-            return make_token(TokenType::GROUP_START);
-        }
-        m_position++;  // consume '?'
-        return get_special_group_or_lookaround_token();
-    }
-
-    Token ECMALexer::get_escape_sequence_token() {
-        // called right after '\'
-        if (m_position >= m_regex.length()) {
-            util::throw_error("ECMA regex syntax error: Unfinished escape sequence at the end of regex");
-        }
-
-        const Z3Char second_char = m_regex[m_position];
-        m_position++;
-        switch (second_char) {
-            case 'd':
-            case 'D':
-            case 'w':
-            case 'W':
-            case 's':
-            case 'S':
-                return make_token(TokenType::CHAR_CLASS_ESCAPE, second_char);
-            case 'b':
-            case 'B':
-                return make_token(TokenType::ASSERTION, second_char);
-            case 'x':
-                return get_hex_escape_seq_token();
-            case 'u':
-                return get_unicode_escape_seq_token();
-            case 'c':
-                return get_control_escape_seq_token();
-            case 'k':
-                return get_named_backref_token();
-            case 't':
-                return make_token(TokenType::LITERAL, CH_HT);
-            case 'n':
-                return make_token(TokenType::LITERAL, CH_LF);
-            case 'r':
-                return make_token(TokenType::LITERAL, CH_CR);
-            case 'f':
-                return make_token(TokenType::LITERAL, CH_FF);
-            case 'v':
-                return make_token(TokenType::LITERAL, CH_VT);
-            case '0':
-            case '1':
-            case '2':
-            case '3':
-            case '4':
-            case '5':
-            case '6':
-            case '7':
-            case '8':
-            case '9':
-                return octal_or_backref(second_char);
-            default:
-                return make_token(TokenType::LITERAL, second_char);
-        }
-    }
-
-    Token ECMALexer::get_token_standard() {
-        const Z3Char current_char = m_regex[m_position];
-        m_position++;
-        switch (current_char) {
-            case '*':
-            case '+':
-            case '?':
-                // lazy quantifier -- not relevant for membership problem, just skip it
-                if (m_regex[m_position] == '?') {
-                    m_position++;
-                }
-                return make_token(TokenType::QUANTIFIER, current_char);
-            case '{':
-                return get_braced_quant_token();
-            case '.':
-                return make_token(TokenType::DOT);
-            case '|':
-                return make_token(TokenType::ALTERNATION);
-            case '^':
-            case '$':
-                return make_token(TokenType::ASSERTION, current_char);
-            case '(':
-                return get_group_token();
-            case ')':
-                return make_token(TokenType::GROUP_END);
-            case '\\':
-                return get_escape_sequence_token();
-            case '[':
-                m_in_char_class = true;
-                m_first_in_char_class = true;
-                return make_token(TokenType::CHAR_CLASS_START);
-            default:
-                return make_token(TokenType::LITERAL, current_char);
-        }
-    }
-
-    Token ECMALexer::get_char_class_escape_sequence_token() {
-        // called right after '\' inside character class
-        if (m_position >= m_regex.length()) {
-            util::throw_error("ECMA regex syntax error: Unfinished escape sequence at the end of regex");
-        }
-
-        const Z3Char second_char = m_regex[m_position];
-        m_position++;
-        switch (second_char) {
-            case 'd':
-            case 'D':
-            case 'w':
-            case 'W':
-            case 's':
-            case 'S':
-                return make_token(TokenType::CHAR_CLASS_ESCAPE, second_char);
-            case 'x':
-                return get_hex_escape_seq_token();
-            case 'u':
-                return get_unicode_escape_seq_token();
-            case 'c':
-                return get_control_escape_seq_token();
-            case 'b':
-                return make_token(TokenType::LITERAL, BACKSPACE_LITERAL);
-            case 't':
-                return make_token(TokenType::LITERAL, CH_HT);
-            case 'n':
-                return make_token(TokenType::LITERAL, CH_LF);
-            case 'r':
-                return make_token(TokenType::LITERAL, CH_CR);
-            case 'f':
-                return make_token(TokenType::LITERAL, CH_FF);
-            case 'v':
-                return make_token(TokenType::LITERAL, CH_VT);
-            case '0':
-            case '1':
-            case '2':
-            case '3':
-            case '4':
-            case '5':
-            case '6':
-            case '7':
-                return get_octal_escape_sequence_token(true, second_char);
-            default:
-                // digits 8 and 9 in escape are '8' and '9' literals as well in char class
-                return make_token(TokenType::LITERAL, second_char);
-        }
-    }
-
-    Token ECMALexer::get_token_char_class() {
-        const Z3Char current_char = m_regex[m_position];
-        m_position++;
-
-        const bool is_first = m_first_in_char_class;
-        m_first_in_char_class = false;
-
-        switch (current_char) {
-            case ']':
-                m_in_char_class = false;
-                return make_token(TokenType::CHAR_CLASS_END);
-            case '-':
-                return make_token(TokenType::CHAR_CLASS_RANGE);
-            case '^':
-                if (is_first) {
-                    return make_token(TokenType::CHAR_CLASS_NEGATION);
-                } else {
-                    return make_token(TokenType::LITERAL, current_char);
-                }
-            case '\\':
-                return get_char_class_escape_sequence_token();
-            default:
-                return make_token(TokenType::LITERAL, current_char);
-        }
-    }
-
-    std::pair<bool, zstring_view> ECMALexer::is_capture_or_named_capture(uint32_t position) const {
-        position++;
-        if (position >= m_regex.length()) {
-            return {false, {}};
-        }
-        if (m_regex[position] != '?') {
-            return {true, {}};
-        }
-        position++;
-        if (position >= m_regex.length() || m_regex[position] != '<') {
-            return {false, {}};
-        }
-
-        const uint32_t name_start = position + 1;
-        uint32_t name_len = 0;
-        bool found_closing_bracket = false;
-        while (++position < m_regex.length()) {
-            const Z3Char current_char = m_regex[position];
-            if (current_char == '>') {
-                found_closing_bracket = true;
-                break;
-            }
-            if (!is_alnum(current_char) && current_char != '_' && current_char != '$') {
-                break;
-            }
-            name_len++;
-        }
-        if (name_len > 0 && found_closing_bracket) {
-            return {true, zstring_view(&m_regex[name_start], name_len)};
-        }
-        return {false, {}};
-    }
-
-    void ECMALexer::perform_first_traverse() {
-        uint32_t open_parens_count = 0;
-        bool in_char_class = false;
-        bool escaped = false;
-
-        for (uint32_t pos = 0; pos < m_regex.length(); pos++) {
-            switch (m_regex[pos]) {
-                case '[':
-                    if (escaped) {
-                        escaped = false;  // '\[' --> ignore that
-                    } else {
-                        in_char_class = true;
-                    }
-                    break;
-                case ']':
-                    if (escaped) {
-                        escaped = false;  // '\]' --> ignore that
-                    } else if (in_char_class) {
-                        in_char_class = false;
-                    }
-                    break;
-                case '\\':
-                    escaped = !escaped;
-                    break;
-                case '(':
-                    if (escaped) {
-                        escaped = false;  // '\(' --> ignore that
-                    } else if (!in_char_class) {
-                        open_parens_count++;
-                        auto [is_capture, name] = is_capture_or_named_capture(pos);
-                        if (is_capture) {
-                            m_num_capture_groups++;
-                            if (name.length() > 0) {
-                                if (m_named_groups.contains(name)) {
-                                    util::throw_error("ECMA Regex error: Duplicate capture group name");
-                                }
-                                m_named_groups.insert(std::make_pair(name, m_num_capture_groups));
-                            }
-                        }
-                    }
-                    break;
-                case ')':
-                    if (escaped) {
-                        escaped = false;  // '\)' --> ignore that
-                    } else if (!in_char_class) {
-                        // match not only capture groups but any group structure (lookarounds,...)
-                        // lets us throw early errors
-                        if (open_parens_count > 0) {
-                            open_parens_count--;
-                        } else {
-                            util::throw_error("Syntax error: Unmatched ')' in regular expression");
-                        }
-                    }
-                    break;
-                default:
-                    escaped = false;
-                    break;
-            }
-        }
-    }
-
     // ================== ECMA REGEX AST ==================
+
+    // ---------------- Disjunction ----------------
+
     uint64_t ASTNodeDisjunction::print_dot(std::ostream& out, uint64_t& node_count) const {
         const uint64_t id = ++node_count;
         out << "  node" << id << " [label=\"DISJUNCTION\"];\n";
@@ -965,6 +473,8 @@ namespace smt::noodler::ecma {
         return cloned;
     }
 
+    // ---------------- Alternative ----------------
+
     uint64_t ASTNodeAlternative::print_dot(std::ostream& out, uint64_t& node_count) const {
         const uint64_t id = ++node_count;
         out << "  node" << id << " [label=\"ALTERNATIVE\"];\n";
@@ -995,7 +505,7 @@ namespace smt::noodler::ecma {
             return app_ref(util_s.re.mk_epsilon(util_s.mk_string_sort()), m);
         }
 
-        // First pass: merge adjacent literals into one string
+        // First pass: merge adjacent characters into one string
         std::vector<RegexComponent> components;
         zstring literal_buf;
         auto flush_literals = [&]() {
@@ -1006,9 +516,10 @@ namespace smt::noodler::ecma {
         };
 
         for (const ASTNodeRef& term : m_terms) {
-            const auto* lit = dynamic_cast<const ASTNodeLiteral*>(term.get());
-            if (lit != nullptr) {
-                literal_buf += lit->get_char();
+            const auto* character = dynamic_cast<const ASTNodeCharacter*>(term.get());
+            if (character != nullptr) {
+                check_representable_char(character->get_char(), util_s);
+                literal_buf += zstring(character->get_char());
             } else {
                 flush_literals();
                 components.emplace_back(term->get_subgraph(graph, util_s, m));
@@ -1082,93 +593,83 @@ namespace smt::noodler::ecma {
         return cloned;
     }
 
+    // ---------------- Assertion ----------------
+
+    static const char* assertion_label(const AssertionKind kind) {
+        switch (kind) {
+            case AssertionKind::START:
+                return "'^'";
+            case AssertionKind::END:
+                return "'$'";
+            case AssertionKind::WORD_BOUNDARY:
+                return "'b'";
+            case AssertionKind::NOT_WORD_BOUNDARY:
+                return "'B'";
+            case AssertionKind::LOOKAHEAD:
+                return "?=";
+            case AssertionKind::NEG_LOOKAHEAD:
+                return "?!";
+            case AssertionKind::LOOKBEHIND:
+                return "?<=";
+            case AssertionKind::NEG_LOOKBEHIND:
+                return "?<!";
+        }
+        return "??";
+    }
+
+    ASTNodeAssertion::ASTNodeAssertion(const AssertionKind kind, ASTNodeRef subpattern)
+        : m_kind(kind),
+          m_subpattern(std::move(subpattern)) {
+        SASSERT(is_lookaround() == (m_subpattern != nullptr));
+    }
+
     uint64_t ASTNodeAssertion::print_dot(std::ostream& out, uint64_t& node_count) const {
         const uint64_t id = ++node_count;
-        std::string label = "ASSERTION (";
+        std::string label = std::string("ASSERTION (") + assertion_label(m_kind) + ")";
+        std::erase(label, '\'');
+        out << "  node" << id << " [label=\"" << label << "\"];\n";
         if (m_subpattern) {
-            switch (m_assert_type) {
-                case TokenType::LOOKAHEAD_POS_START:
-                    label += "?=";
-                    break;
-                case TokenType::LOOKAHEAD_NEG_START:
-                    label += "?!";
-                    break;
-                case TokenType::LOOKBEHIND_POS_START:
-                    label += "?<=";
-                    break;
-                case TokenType::LOOKBEHIND_NEG_START:
-                    label += "?<!";
-                    break;
-                default:
-                    break;
-            }
-            label += ")";
-            out << "  node" << id << " [label=\"" << label << "\"];\n";
             const uint64_t child_id = m_subpattern->print_dot(out, node_count);
             out << "  node" << id << " -> node" << child_id << ";\n";
-        } else {
-            label += std::string(1, static_cast<char>(m_payload)) + ")";
-            out << "  node" << id << " [label=\"" << label << "\"];\n";
         }
         return id;
     }
 
     zstring ASTNodeAssertion::serialize() const {
+        zstring res = zstring("(ASSERT ") + zstring(assertion_label(m_kind));
         if (m_subpattern) {
-            zstring label;
-            switch (m_assert_type) {
-                case TokenType::LOOKAHEAD_POS_START:
-                    label = zstring("?=");
-                    break;
-                case TokenType::LOOKAHEAD_NEG_START:
-                    label = zstring("?!");
-                    break;
-                case TokenType::LOOKBEHIND_POS_START:
-                    label = zstring("?<=");
-                    break;
-                case TokenType::LOOKBEHIND_NEG_START:
-                    label = zstring("?<!");
-                    break;
-                default:
-                    label = zstring("??");
-                    break;
-            }
-            return zstring("(ASSERT ") + label + zstring(" ") + m_subpattern->serialize() + zstring(")");
+            res += zstring(" ") + m_subpattern->serialize();
         }
-        return zstring("(ASSERT '") + zstring(m_payload) + zstring("')");
+        return res + zstring(")");
     }
 
-    void ASTNodeAssertion::set_type(const TokenType type) {
-        m_assert_type = type;
+    AssertionKind ASTNodeAssertion::get_kind() const {
+        return m_kind;
     }
 
-    void ASTNodeAssertion::set_payload(const Z3Char payload) {
-        m_payload = payload;
-    }
-
-    void ASTNodeAssertion::set_expr(ASTNodeRef expr) {
-        m_subpattern = std::move(expr);
+    bool ASTNodeAssertion::is_lookaround() const {
+        return m_kind == AssertionKind::LOOKAHEAD || m_kind == AssertionKind::NEG_LOOKAHEAD ||
+               m_kind == AssertionKind::LOOKBEHIND || m_kind == AssertionKind::NEG_LOOKBEHIND;
     }
 
     RegexComponent ASTNodeAssertion::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const {
         // Anchors -- directly create AssertionEdge with the anchor as the payload
-        if (m_assert_type == TokenType::ASSERTION) {
-            if (m_payload == '^' || m_payload == '$') {
-                VertexID v_in = graph.create_vertex();
-                VertexID v_out = graph.create_vertex();
-                EdgeID eid = graph.create_edge(v_out, RCGEdgePayload {AssertionEdge {Anchor {m_payload}}});
-                graph.vertices[v_in].outgoing_edges.push_back(eid);
-                return GraphFragment {v_in, v_out, {eid}};
-            }
-            return make_word_boundary_fragment(graph, util_s, m, m_payload == 'b');
+        if (m_kind == AssertionKind::START || m_kind == AssertionKind::END) {
+            const Anchor anchor = m_kind == AssertionKind::START ? '^' : '$';
+            VertexID v_in = graph.create_vertex();
+            VertexID v_out = graph.create_vertex();
+            EdgeID eid = graph.create_edge(v_out, RCGEdgePayload {AssertionEdge {anchor}});
+            graph.vertices[v_in].outgoing_edges.push_back(eid);
+            return GraphFragment {v_in, v_out, {eid}};
+        }
+        if (m_kind == AssertionKind::WORD_BOUNDARY || m_kind == AssertionKind::NOT_WORD_BOUNDARY) {
+            return make_word_boundary_fragment(graph, util_s, m, m_kind == AssertionKind::WORD_BOUNDARY);
         }
 
         const RegexComponent inner_regex = m_subpattern->get_subgraph(graph, util_s, m);
 
-        const bool is_forward =
-            (m_assert_type == TokenType::LOOKAHEAD_POS_START || m_assert_type == TokenType::LOOKAHEAD_NEG_START);
-        const bool is_positive =
-            (m_assert_type == TokenType::LOOKAHEAD_POS_START || m_assert_type == TokenType::LOOKBEHIND_POS_START);
+        const bool is_forward = (m_kind == AssertionKind::LOOKAHEAD || m_kind == AssertionKind::NEG_LOOKAHEAD);
+        const bool is_positive = (m_kind == AssertionKind::LOOKAHEAD || m_kind == AssertionKind::LOOKBEHIND);
         const LookaroundDirection dir = is_forward ? LookaroundDirection::FORWARD : LookaroundDirection::BACKWARD;
 
         // Lookarounds with regular content --> create AssertionEdge with regex as payload
@@ -1180,7 +681,7 @@ namespace smt::noodler::ecma {
         // quantification. Lookarounds with regular content can be expressed as a negation of regular language -->
         // supported.
         if (!is_positive) {
-            util::throw_error("Unsupported: negative lookaround with non-regular inner content "
+            util::throw_error("ECMA regex unsupported: negative lookaround with non-regular inner content "
                               "(would require universal quantifiers)");
         }
 
@@ -1214,11 +715,9 @@ namespace smt::noodler::ecma {
     }
 
     void ASTNodeAssertion::strip_captures() {
-        if (m_assert_type == TokenType::ASSERTION) {
-            // anchors have no capture groups to strip
-            return;
+        if (m_subpattern != nullptr) {
+            m_subpattern->strip_captures();
         }
-        m_subpattern->strip_captures();
     }
 
     void ASTNodeAssertion::collect_backrefs(std::unordered_set<GroupID>& refs) const {
@@ -1234,13 +733,7 @@ namespace smt::noodler::ecma {
     }
 
     ASTNodeRef ASTNodeAssertion::clone() const {
-        auto cloned = std::make_unique<ASTNodeAssertion>();
-        cloned->m_assert_type = m_assert_type;
-        cloned->m_payload = m_payload;
-        if (m_subpattern) {
-            cloned->m_subpattern = m_subpattern->clone();
-        }
-        return cloned;
+        return std::make_unique<ASTNodeAssertion>(m_kind, m_subpattern ? m_subpattern->clone() : nullptr);
     }
 
     GraphFragment ASTNodeAssertion::make_assertion_fragment(RegexConstraintGraph& graph, ast_manager& m,
@@ -1256,8 +749,8 @@ namespace smt::noodler::ecma {
 
     GraphFragment ASTNodeAssertion::make_word_boundary_fragment(RegexConstraintGraph& graph, seq_util& util_s,
                                                                 ast_manager& m, const bool is_word_boundary) {
-        //  A word boundary matches at a position where one side is a word char (\w) and the other is not. This is
-        //  modelled as two branches in alternation:
+        //  A word boundary matches at a position where one side is a word char (\w) and the other is not
+        //  (21.2.2.6 Assertion, IsWordChar). This is modelled as two branches in alternation:
         //    branch1: lookbehind(\w) AND lookahead(\W) -- or the reverse for '\B'
         //    branch2: lookbehind(\W) AND lookahead(\w) -- or the reverse for '\B'
         //  Each branch is built as a chain of two assertion fragments.
@@ -1278,68 +771,62 @@ namespace smt::noodler::ecma {
         return alternate_fragments(graph, branch1, branch2);
     }
 
-    uint64_t ASTNodeQuantifier::print_dot(std::ostream& out, uint64_t& node_count) const {
-        const uint64_t id = ++node_count;
-        out << "  node" << id << " [label=\"QUANTIFIER {" << m_range.min << ",";
-        if (m_range.max == UNBOUNDED) {
-            out << "inf";
-        } else {
-            out << m_range.max;
+    // ---------------- Quantified atom ----------------
+
+    static std::string quantifier_to_string(const Quantifier& quantifier) {
+        std::string res = "{" + std::to_string(quantifier.min) + ",";
+        res += quantifier.max == UNBOUNDED ? "inf" : std::to_string(quantifier.max);
+        res += "}";
+        if (!quantifier.greedy) {
+            res += " lazy";
         }
-        out << "}\"];\n";
-        const uint64_t child_id = m_child->print_dot(out, node_count);
+        return res;
+    }
+
+    ASTNodeQuantified::ASTNodeQuantified(const Quantifier quantifier, ASTNodeRef atom)
+        : m_quantifier(quantifier),
+          m_atom(std::move(atom)) {
+        SASSERT(m_quantifier.min <= m_quantifier.max);
+    }
+
+    uint64_t ASTNodeQuantified::print_dot(std::ostream& out, uint64_t& node_count) const {
+        const uint64_t id = ++node_count;
+        out << "  node" << id << " [label=\"QUANTIFIER " << quantifier_to_string(m_quantifier) << "\"];\n";
+        const uint64_t child_id = m_atom->print_dot(out, node_count);
         out << "  node" << id << " -> node" << child_id << ";\n";
         return id;
     }
 
-    zstring ASTNodeQuantifier::serialize() const {
-        const zstring max_str = (m_range.max == UNBOUNDED) ? zstring("inf") : zstring(std::to_string(m_range.max));
-        const zstring min_str = zstring(std::to_string(m_range.min));
-
-        return zstring("(QUANT {") + min_str + zstring(",") + max_str + zstring("} ") + m_child->serialize() +
-               zstring(")");
+    zstring ASTNodeQuantified::serialize() const {
+        return zstring("(QUANT ") + zstring(quantifier_to_string(m_quantifier).c_str()) + zstring(" ") +
+               m_atom->serialize() + zstring(")");
     }
 
-    void ASTNodeQuantifier::set(const Token& t, ASTNodeRef term) {
-        if (std::holds_alternative<QuantifierRange>(t.payload)) {
-            m_range = std::get<QuantifierRange>(t.payload);
-        } else if (std::holds_alternative<Z3Char>(t.payload)) {
-            const Z3Char ch = std::get<Z3Char>(t.payload);
-            if (ch == '*') {
-                m_range = {0, UNBOUNDED};
-            } else if (ch == '+') {
-                m_range = {1, UNBOUNDED};
-            } else if (ch == '?') {
-                m_range = {0, 1};
-            }
-        }
-        m_child = std::move(term);
+    const Quantifier& ASTNodeQuantified::get_quantifier() const {
+        return m_quantifier;
     }
 
-    void ASTNodeQuantifier::strip_captures() {
-        m_child->strip_captures();
+    void ASTNodeQuantified::strip_captures() {
+        m_atom->strip_captures();
     }
 
-    ASTNodeRef ASTNodeQuantifier::clone() const {
-        auto cloned = std::make_unique<ASTNodeQuantifier>();
-        cloned->m_range = m_range;
-        cloned->m_child = m_child->clone();
-        return cloned;
+    ASTNodeRef ASTNodeQuantified::clone() const {
+        return std::make_unique<ASTNodeQuantified>(m_quantifier, m_atom->clone());
     }
 
-    ASTNodeRef ASTNodeQuantifier::unroll() const {
+    ASTNodeRef ASTNodeQuantified::unroll() const {
         auto disj = std::make_unique<ASTNodeDisjunction>();
 
-        if (m_range.min == 0) {
+        if (m_quantifier.min == 0) {
             disj->add_alternative(std::make_unique<ASTNodeAlternative>());
         }
 
         // Create chains with (min, min+1, ..., max) subtrees and alternate them all.
-        const uint64_t start = std::max<uint64_t>(1, m_range.min);
-        for (uint64_t k = start; k <= m_range.max; ++k) {
+        const uint64_t start = std::max<uint64_t>(1, m_quantifier.min);
+        for (uint64_t k = start; k <= m_quantifier.max; ++k) {
             auto alt = std::make_unique<ASTNodeAlternative>();
             for (uint64_t i = 0; i < k; ++i) {
-                alt->add_term(m_child->clone());
+                alt->add_term(m_atom->clone());
             }
             disj->add_alternative(std::move(alt));
         }
@@ -1347,14 +834,16 @@ namespace smt::noodler::ecma {
         return disj;
     }
 
-    RegexComponent ASTNodeQuantifier::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s,
+    RegexComponent ASTNodeQuantified::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s,
                                                    ast_manager& m) const {
-        const RegexComponent child_subgraph = m_child->get_subgraph(graph, util_s, m);
+        const RegexComponent child_subgraph = m_atom->get_subgraph(graph, util_s, m);
+        const uint64_t min = m_quantifier.min;
+        const uint64_t max = m_quantifier.max;
 
         if (std::holds_alternative<GraphFragment>(child_subgraph)) {
             // Nonregular fragments under unbounded quantifiers -- unsupported.
-            if (m_range.max == UNBOUNDED) {
-                util::throw_error("Unsupported regex structure: Non-regular constructs under kleene star/kleene plus");
+            if (max == UNBOUNDED) {
+                util::throw_error("ECMA regex unsupported: non-regular constructs under an unbounded quantifier");
             }
             // Nonregular fragments under bounded quantifier -- statically unroll the AST and convert to graph fragment.
             return unroll()->get_subgraph(graph, util_s, m);
@@ -1365,15 +854,15 @@ namespace smt::noodler::ecma {
         const app_ref child_expr = std::get<app_ref>(child_subgraph);
         app* quant = nullptr;
 
-        if (m_range.max == UNBOUNDED) {
-            if (m_range.min == 0) {
+        if (max == UNBOUNDED) {
+            if (min == 0) {
                 quant = util_s.re.mk_star(child_expr);
-            } else if (m_range.min == 1) {
+            } else if (min == 1) {
                 quant = util_s.re.mk_plus(child_expr);
             } else {
                 // Concatenation `min` times followed by kleene star
                 quant = child_expr;
-                for (uint64_t i = 1; i < m_range.min; i++) {
+                for (uint64_t i = 1; i < min; i++) {
                     quant = util_s.re.mk_concat(quant, child_expr);
                 }
                 quant = util_s.re.mk_concat(quant, util_s.re.mk_star(child_expr));
@@ -1381,18 +870,13 @@ namespace smt::noodler::ecma {
         } else {
             // For some reason, using mk_loop and mk_power directly leads to unsoudness of the solver, although the
             // semantics should be the same as concatenation.
-            // if (m_range.min == m_range.max) {
-            //     quant = util_s.re.mk_power(child_expr, m_range.min);
-            // } else {
-            //     quant = util_s.re.mk_loop(child_expr, m_range.min, m_range.max);
-            // }
-            if (m_range.min == m_range.max) {
-                if (m_range.min == 0) {
+            if (min == max) {
+                if (min == 0) {
                     quant = util_s.re.mk_epsilon(util_s.mk_string_sort());
                 } else {
                     // A concrete number of concatenations
                     quant = child_expr;
-                    for (uint64_t i = 1; i < m_range.min; i++) {
+                    for (uint64_t i = 1; i < min; i++) {
                         quant = util_s.re.mk_concat(quant, child_expr);
                     }
                 }
@@ -1400,9 +884,9 @@ namespace smt::noodler::ecma {
                 // Range [min, max]:
                 // Obligatory part -- at least `min` times
                 app* at_least_min = util_s.re.mk_epsilon(util_s.mk_string_sort());
-                if (m_range.min > 0) {
+                if (min > 0) {
                     at_least_min = child_expr;
-                    for (uint64_t i = 1; i < m_range.min; i++) {
+                    for (uint64_t i = 1; i < min; i++) {
                         at_least_min = util_s.re.mk_concat(at_least_min, child_expr);
                     }
                 }
@@ -1413,7 +897,7 @@ namespace smt::noodler::ecma {
 
                 // Chain the optional pattern `max` - `min` times
                 app* up_to_max = re_optional;
-                for (uint64_t i = 1; i < (m_range.max - m_range.min); i++) {
+                for (uint64_t i = 1; i < (max - min); i++) {
                     up_to_max = util_s.re.mk_concat(up_to_max, re_optional);
                 }
 
@@ -1425,42 +909,46 @@ namespace smt::noodler::ecma {
         return app_ref(quant, m);
     }
 
-    void ASTNodeQuantifier::collect_backrefs(std::unordered_set<GroupID>& refs) const {
-        m_child->collect_backrefs(refs);
+    void ASTNodeQuantified::collect_backrefs(std::unordered_set<GroupID>& refs) const {
+        m_atom->collect_backrefs(refs);
     }
 
-    void ASTNodeQuantifier::strip_unreferenced_captures(const std::unordered_set<GroupID>& referenced) {
-        m_child->strip_unreferenced_captures(referenced);
+    void ASTNodeQuantified::strip_unreferenced_captures(const std::unordered_set<GroupID>& referenced) {
+        m_atom->strip_unreferenced_captures(referenced);
     }
 
-    uint64_t ASTNodeLiteral::print_dot(std::ostream& out, uint64_t& node_count) const {
+    // ---------------- Character ----------------
+
+    ASTNodeCharacter::ASTNodeCharacter(const Z3Char ch)
+        : m_char(ch) { }
+
+    uint64_t ASTNodeCharacter::print_dot(std::ostream& out, uint64_t& node_count) const {
         const uint64_t id = ++node_count;
-        out << "  node" << id << " [label=\"LITERAL ('" << static_cast<char>(m_char) << "')\"];\n";
+        std::string label = char_to_string(m_char);
+        std::erase(label, '"');
+        std::erase(label, '\\');
+        out << "  node" << id << " [label=\"LITERAL (" << label << ")\"];\n";
         return id;
     }
 
-    zstring ASTNodeLiteral::serialize() const {
-        return zstring("(LIT '") + zstring(m_char) + zstring("')");
+    zstring ASTNodeCharacter::serialize() const {
+        return zstring("(LIT ") + char_to_zstring(m_char) + zstring(")");
     }
 
-    void ASTNodeLiteral::set_char(const Z3Char ch) {
-        m_char = ch;
-    }
-
-    Z3Char ASTNodeLiteral::get_char() const {
+    Z3Char ASTNodeCharacter::get_char() const {
         return m_char;
     }
 
-    RegexComponent ASTNodeLiteral::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const {
-        // Always return mk.to_re(mk_string(char))
-        SASSERT(m_char < std::numeric_limits<Z3Char>::max());
-        app* str_unit = util_s.str.mk_string(m_char);
-        return app_ref(util_s.re.mk_to_re(str_unit), m);
+    RegexComponent ASTNodeCharacter::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const {
+        check_representable_char(m_char, util_s);
+        return app_ref(util_s.re.mk_to_re(util_s.str.mk_string(zstring(m_char))), m);
     }
 
-    ASTNodeRef ASTNodeLiteral::clone() const {
-        return std::make_unique<ASTNodeLiteral>(*this);
+    ASTNodeRef ASTNodeCharacter::clone() const {
+        return std::make_unique<ASTNodeCharacter>(*this);
     }
+
+    // ---------------- Dot ----------------
 
     uint64_t ASTNodeDot::print_dot(std::ostream& out, uint64_t& node_count) const {
         const uint64_t id = ++node_count;
@@ -1473,47 +961,83 @@ namespace smt::noodler::ecma {
     }
 
     RegexComponent ASTNodeDot::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const {
-        return app_ref(util_s.re.mk_full_char(nullptr), m);
+        // DotAll is false (the `s` flag is not supported) --> all characters except LineTerminator (21.2.2.8 Atom)
+        app* line_terminators = util_s.re.mk_to_re(util_s.str.mk_string(zstring(CH_LF)));
+        for (const Z3Char ch : {CH_CR, CH_LS, CH_PS}) {
+            line_terminators = util_s.re.mk_union(line_terminators, util_s.re.mk_to_re(util_s.str.mk_string(zstring(ch))));
+        }
+        return app_ref(mk_char_complement(util_s, line_terminators), m);
     }
 
     ASTNodeRef ASTNodeDot::clone() const {
         return std::make_unique<ASTNodeDot>(*this);
     }
 
-    uint64_t ASTNodeBackref::print_dot(std::ostream& out, uint64_t& node_count) const {
+    // ---------------- Backreference ----------------
+
+    ASTNodeBackreference::ASTNodeBackreference(const GroupID group_id, const zstring_view group_name)
+        : m_group_id(group_id),
+          m_group_name(group_name) { }
+
+    uint64_t ASTNodeBackreference::print_dot(std::ostream& out, uint64_t& node_count) const {
         const uint64_t id = ++node_count;
-        out << "  node" << id << " [label=\"BACKREF\"];\n";
+        out << "  node" << id << " [label=\"BACKREF " << m_group_id << "\"];\n";
         return id;
     }
 
-    zstring ASTNodeBackref::serialize() const {
-        return zstring("(BACKREF ") + std::to_string(m_backref_id) + zstring(")");
+    zstring ASTNodeBackreference::serialize() const {
+        zstring res = zstring("(BACKREF ") + zstring(std::to_string(m_group_id).c_str());
+        if (m_group_name.length() > 0) {
+            res += zstring(" <") + m_group_name.to_zstring() + zstring(">");
+        }
+        return res + zstring(")");
     }
 
-    void ASTNodeBackref::set_ref(const GroupID backref_number) {
-        m_backref_id = backref_number;
+    GroupID ASTNodeBackreference::get_group_id() const {
+        return m_group_id;
     }
 
-    RegexComponent ASTNodeBackref::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const {
+    void ASTNodeBackreference::set_group_id(const GroupID group_id) {
+        m_group_id = group_id;
+    }
+
+    zstring_view ASTNodeBackreference::get_group_name() const {
+        return m_group_name;
+    }
+
+    RegexComponent ASTNodeBackreference::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s,
+                                                      ast_manager& m) const {
         const VertexID vin = graph.create_vertex();
         const VertexID vout = graph.create_vertex();
-        const EdgeID backref_eid = graph.create_edge(vout, {BackrefEdge {m_backref_id}});
+        const EdgeID backref_eid = graph.create_edge(vout, {BackrefEdge {m_group_id}});
         graph.vertices[vin].outgoing_edges.push_back(backref_eid);
         return GraphFragment {vin, vout, {backref_eid}};
     }
 
-    ASTNodeRef ASTNodeBackref::clone() const {
-        return std::make_unique<ASTNodeBackref>(*this);
+    ASTNodeRef ASTNodeBackreference::clone() const {
+        return std::make_unique<ASTNodeBackreference>(*this);
     }
 
-    void ASTNodeBackref::collect_backrefs(std::unordered_set<GroupID>& refs) const {
-        refs.insert(m_backref_id);
+    void ASTNodeBackreference::collect_backrefs(std::unordered_set<GroupID>& refs) const {
+        refs.insert(m_group_id);
     }
+
+    // ---------------- Group ----------------
+
+    ASTNodeGroup::ASTNodeGroup(ASTNodeRef child)
+        : m_capturing(false),
+          m_child(std::move(child)) { }
+
+    ASTNodeGroup::ASTNodeGroup(const GroupID gid, ASTNodeRef child, const zstring_view name)
+        : m_capturing(true),
+          m_gid(gid),
+          m_name(name),
+          m_child(std::move(child)) { }
 
     uint64_t ASTNodeGroup::print_dot(std::ostream& out, uint64_t& node_count) const {
         const uint64_t id = ++node_count;
         std::string label = "GROUP";
-        if (m_type == GroupType::NONCAPTURE) {
+        if (!m_capturing) {
             label += " (?:)";
         } else {
             label += " #" + std::to_string(m_gid);
@@ -1527,30 +1051,33 @@ namespace smt::noodler::ecma {
 
     zstring ASTNodeGroup::serialize() const {
         zstring label;
-        if (m_type == GroupType::NONCAPTURE) {
+        if (!m_capturing) {
             label = zstring("GROUP-NONCAP");
         } else {
-            label = zstring("GROUP #") + std::to_string(m_gid);
+            label = zstring("GROUP #") + zstring(std::to_string(m_gid).c_str());
+            if (m_name.length() > 0) {
+                label += zstring(" <") + m_name.to_zstring() + zstring(">");
+            }
         }
         return zstring("(") + label + zstring(" ") + m_child->serialize() + zstring(")");
     }
 
-    void ASTNodeGroup::set_type(const GroupType type) {
-        m_type = type;
+    bool ASTNodeGroup::is_capturing() const {
+        return m_capturing;
     }
 
-    void ASTNodeGroup::set_expr(ASTNodeRef expr) {
-        m_child = std::move(expr);
+    GroupID ASTNodeGroup::get_id() const {
+        return m_gid;
     }
 
-    void ASTNodeGroup::set_id(const GroupID gid) {
-        m_gid = gid;
+    zstring_view ASTNodeGroup::get_name() const {
+        return m_name;
     }
 
     RegexComponent ASTNodeGroup::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const {
         RegexComponent subregex = m_child->get_subgraph(graph, util_s, m);
         // Noncapturing groups --> no semantic meaning for the subregex
-        if (m_type == GroupType::NONCAPTURE) {
+        if (!m_capturing) {
             return subregex;
         }
 
@@ -1581,9 +1108,7 @@ namespace smt::noodler::ecma {
     }
 
     void ASTNodeGroup::strip_captures() {
-        if (m_type == GroupType::CAPTURE) {
-            m_type = GroupType::NONCAPTURE;
-        }
+        m_capturing = false;
         m_child->strip_captures();
     }
 
@@ -1592,19 +1117,91 @@ namespace smt::noodler::ecma {
     }
 
     void ASTNodeGroup::strip_unreferenced_captures(const std::unordered_set<GroupID>& referenced) {
-        if (m_type == GroupType::CAPTURE && !referenced.contains(m_gid)) {
-            m_type = GroupType::NONCAPTURE;
+        if (m_capturing && !referenced.contains(m_gid)) {
+            m_capturing = false;
         }
         m_child->strip_unreferenced_captures(referenced);
     }
 
     ASTNodeRef ASTNodeGroup::clone() const {
-        auto cloned = std::make_unique<ASTNodeGroup>();
-        cloned->m_type = m_type;
-        cloned->m_gid = m_gid;
-        cloned->m_child = m_child->clone();
-        return cloned;
+        if (!m_capturing) {
+            return std::make_unique<ASTNodeGroup>(m_child->clone());
+        }
+        return std::make_unique<ASTNodeGroup>(m_gid, m_child->clone(), m_name);
     }
+
+    // ---------------- Character class ----------------
+
+    static char class_escape_letter(const ClassEscapeKind kind) {
+        switch (kind) {
+            case ClassEscapeKind::DIGIT:
+                return 'd';
+            case ClassEscapeKind::NOT_DIGIT:
+                return 'D';
+            case ClassEscapeKind::SPACE:
+                return 's';
+            case ClassEscapeKind::NOT_SPACE:
+                return 'S';
+            case ClassEscapeKind::WORD:
+                return 'w';
+            case ClassEscapeKind::NOT_WORD:
+                return 'W';
+            case ClassEscapeKind::PROPERTY:
+                return 'p';
+            case ClassEscapeKind::NOT_PROPERTY:
+                return 'P';
+        }
+        return '?';
+    }
+
+    // E.g. 'd' for \d, or 'p' {gc=Lu} for \p{gc=Lu}
+    static std::string class_escape_to_string(const CharClassEscape& escape) {
+        std::string res = std::string("'") + class_escape_letter(escape.kind) + "'";
+        if (escape.kind == ClassEscapeKind::PROPERTY || escape.kind == ClassEscapeKind::NOT_PROPERTY) {
+            res += " {";
+            if (escape.property_name.length() > 0) {
+                res += escape.property_name.to_zstring().encode() + "=";
+            }
+            res += escape.property_value.to_zstring().encode() + "}";
+        }
+        return res;
+    }
+
+    // The set of characters of a character class escape (21.2.2.12 CharacterClassEscape)
+    static app* mk_class_escape_regex(const CharClassEscape& escape, seq_util& util_s) {
+        switch (escape.kind) {
+            case ClassEscapeKind::DIGIT:
+            case ClassEscapeKind::NOT_DIGIT: {
+                app* re_digit = util_s.re.mk_range(util_s.str.mk_string("0"), util_s.str.mk_string("9"));
+                return escape.kind == ClassEscapeKind::DIGIT ? re_digit : mk_char_complement(util_s, re_digit);
+            }
+            case ClassEscapeKind::SPACE:
+            case ClassEscapeKind::NOT_SPACE: {
+                sort* re_sort = util_s.re.mk_re(util_s.mk_string_sort());
+                app* re_whitespace = nullptr;
+                for (const ClassRange& range : WHITESPACE_RANGES) {
+                    app* re_range = util_s.re.mk_range(re_sort, range.lo, range.hi);
+                    re_whitespace = re_whitespace == nullptr ? re_range : util_s.re.mk_union(re_whitespace, re_range);
+                }
+                return escape.kind == ClassEscapeKind::SPACE ? re_whitespace
+                                                             : mk_char_complement(util_s, re_whitespace);
+            }
+            case ClassEscapeKind::WORD:
+            case ClassEscapeKind::NOT_WORD: {
+                // IgnoreCase is false --> WordCharacters() are exactly [a-zA-Z0-9_] (21.2.2.6.1)
+                app* re_word = util_s.re.mk_word_char();
+                return escape.kind == ClassEscapeKind::WORD ? re_word : mk_char_complement(util_s, re_word);
+            }
+            case ClassEscapeKind::PROPERTY:
+            case ClassEscapeKind::NOT_PROPERTY:
+                util::throw_error("ECMA regex unsupported: Unicode property escapes (\\p{...}, \\P{...})");
+                break;
+        }
+        return nullptr;
+    }
+
+    ASTNodeCharClass::ASTNodeCharClass(const bool negated)
+        : m_is_negated(negated) { }
 
     uint64_t ASTNodeCharClass::print_dot(std::ostream& out, uint64_t& node_count) const {
         const uint64_t id = ++node_count;
@@ -1613,20 +1210,20 @@ namespace smt::noodler::ecma {
             label += "^";
         }
 
-        for (const auto& [kind, lower, upper] : m_elements) {
-            if (kind == ElementType::SINGLE) {
-                label += static_cast<char>(lower);
-            } else if (kind == ElementType::ESCAPE) {
-                label += "\\";
-                label += static_cast<char>(lower);
+        for (const ClassItem& item : m_items) {
+            if (std::holds_alternative<CharClassEscape>(item)) {
+                label += " \\" + class_escape_to_string(std::get<CharClassEscape>(item));
             } else {
-                SASSERT(kind == ElementType::RANGE);
-                label += static_cast<char>(lower);
-                label += "-";
-                label += static_cast<char>(upper);
+                const ClassRange& range = std::get<ClassRange>(item);
+                label += " " + char_to_string(range.lo);
+                if (range.lo != range.hi) {
+                    label += "-" + char_to_string(range.hi);
+                }
             }
         }
-        label += "]";
+        label += " ]";
+        std::erase(label, '"');
+        std::erase(label, '\\');
 
         out << "  node" << id << " [label=\"" << label << "\"];\n";
         return id;
@@ -1637,114 +1234,69 @@ namespace smt::noodler::ecma {
         if (m_is_negated) {
             res += zstring(" ^");
         }
-        for (const auto& [kind, lower, upper] : m_elements) {
-            if (kind == ElementType::SINGLE) {
-                res += zstring(" (LIT '") + zstring(lower) + zstring("')");
-            } else if (kind == ElementType::ESCAPE) {
-                res += zstring(" (CHAR_CLASS '") + zstring(lower) + zstring("')");
+        for (const ClassItem& item : m_items) {
+            if (std::holds_alternative<CharClassEscape>(item)) {
+                res += zstring(" (CHAR_CLASS ") +
+                       zstring(class_escape_to_string(std::get<CharClassEscape>(item)).c_str()) + zstring(")");
             } else {
-                SASSERT(kind == ElementType::RANGE);
-                res += zstring(" (RANGE '") + zstring(lower) + zstring("' '") + zstring(upper) + zstring("')");
+                const ClassRange& range = std::get<ClassRange>(item);
+                if (range.lo == range.hi) {
+                    res += zstring(" (LIT ") + char_to_zstring(range.lo) + zstring(")");
+                } else {
+                    res += zstring(" (RANGE ") + char_to_zstring(range.lo) + zstring(" ") + char_to_zstring(range.hi) +
+                           zstring(")");
+                }
             }
         }
         res += zstring(")");
         return res;
     }
 
-    void ASTNodeCharClass::add_element(const CharClassElement elem) {
-        if (elem.kind == ElementType::RANGE && elem.lower > elem.upper) {
-            util::throw_error("ECMA Regex error: Character range out of order");
+    void ASTNodeCharClass::add_item(ClassItem item) {
+        if (std::holds_alternative<ClassRange>(item) && std::get<ClassRange>(item).lo > std::get<ClassRange>(item).hi) {
+            util::throw_error("ECMA regex syntax error: range out of order in character class");
         }
-        m_elements.push_back(elem);
+        m_items.push_back(std::move(item));
     }
 
-    void ASTNodeCharClass::set_negation(const bool neg) {
-        m_is_negated = neg;
+    bool ASTNodeCharClass::is_negated() const {
+        return m_is_negated;
+    }
+
+    const std::vector<ClassItem>& ASTNodeCharClass::get_items() const {
+        return m_items;
     }
 
     RegexComponent ASTNodeCharClass::get_subgraph(RegexConstraintGraph& graph, seq_util& util_s, ast_manager& m) const {
-        SASSERT(!m_elements.empty());
-        app_ref_vector class_elements(m);
+        sort* re_sort = util_s.re.mk_re(util_s.mk_string_sort());
+        const Z3Char max_char = util_s.max_char();
 
-        for (const CharClassElement& elem : m_elements) {
-            if (elem.kind == ElementType::SINGLE) {
-                // Single character -- make str.to_re(char)
-                app* unit_str = util_s.str.mk_string(elem.lower);
-                class_elements.push_back(util_s.re.mk_to_re(unit_str));
-            } else if (elem.kind == ElementType::RANGE) {
-                // Same character -- just make a single string
-                if (elem.lower == elem.upper) {
-                    app* unit_str = util_s.str.mk_string(elem.lower);
-                    class_elements.push_back(util_s.re.mk_to_re(unit_str));
+        // Unite all the class items (21.2.2.13 CharacterClass -- the class is the union of its ClassRanges)
+        app* class_re = nullptr;
+        for (const ClassItem& item : m_items) {
+            app* item_re = nullptr;
+            if (std::holds_alternative<CharClassEscape>(item)) {
+                item_re = mk_class_escape_regex(std::get<CharClassEscape>(item), util_s);
+            } else {
+                const ClassRange& range = std::get<ClassRange>(item);
+                // Characters above the maximal character of the string encoding cannot occur in any string
+                if (range.lo > max_char) {
                     continue;
                 }
-                // Range of characters -- make re.range(char1, char2)
-                app* lower = util_s.str.mk_string(elem.lower);
-                app* upper = util_s.str.mk_string(elem.upper);
-                class_elements.push_back(util_s.re.mk_range(lower, upper));
-            } else {
-                // Character class
-                switch (elem.lower) {
-                    case 'd':
-                    case 'D': {
-                        // Digit character class -- re.range(0, 9)
-                        app* lower = util_s.str.mk_string("0");
-                        app* upper = util_s.str.mk_string("9");
-                        app* re_digit = util_s.re.mk_range(lower, upper);
-                        // Nondigit character class -- Sigma* - re.range(0, 9)
-                        if (elem.lower == 'D') {
-                            re_digit =
-                                util_s.re.mk_inter(util_s.re.mk_full_char(nullptr), util_s.re.mk_complement(re_digit));
-                        }
-                        class_elements.push_back(re_digit);
-                        break;
-                    }
-                    case 's':
-                    case 'S': {
-                        constexpr std::array<Z3Char, 11> whitespaces {CH_HT, CH_VT, CH_FF, CH_SP, CH_NBSP, CH_ZWNBSP,
-                                                                      CH_US, CH_LF, CH_CR, CH_LS, CH_PS};
-                        // Unite all the whitespaces
-                        app* re_whitespace = util_s.re.mk_to_re(util_s.str.mk_string(whitespaces[0]));
-                        for (std::size_t i = 1; i < whitespaces.size(); i++) {
-                            app* whitespace_str = util_s.re.mk_to_re(util_s.str.mk_string(whitespaces[i]));
-                            re_whitespace = util_s.re.mk_union(re_whitespace, whitespace_str);
-                        }
-                        // Non-whitespace class -- Sigma* - \s
-                        if (elem.lower == 'S') {
-                            re_whitespace = util_s.re.mk_inter(util_s.re.mk_full_char(nullptr),
-                                                               util_s.re.mk_complement(re_whitespace));
-                        }
-                        class_elements.push_back(re_whitespace);
-                        break;
-                    }
-                    case 'w':
-                    case 'W': {
-                        // Word/nonword character classes
-                        app* re_word = util_s.re.mk_word_char();
-                        // Sigma* - \w
-                        if (elem.lower == 'W') {
-                            re_word =
-                                util_s.re.mk_inter(util_s.re.mk_full_char(nullptr), util_s.re.mk_complement(re_word));
-                        }
-                        class_elements.push_back(re_word);
-                        break;
-                    }
-                }
+                item_re = util_s.re.mk_range(re_sort, range.lo, std::min(range.hi, max_char));
             }
+            class_re = class_re == nullptr ? item_re : util_s.re.mk_union(class_re, item_re);
         }
 
-        app_ref current_class_re(class_elements.get(0), m);
-        for (std::size_t i = 1; i < class_elements.size(); ++i) {
-            // Unite all the class elements we got in previous steps
-            current_class_re = util_s.re.mk_union(current_class_re, class_elements.get(i));
-        }
-        if (m_is_negated) {
-            // Negated character class -- Sigma* - class_re
-            current_class_re =
-                util_s.re.mk_inter(util_s.re.mk_full_char(nullptr), util_s.re.mk_complement(current_class_re));
+        // An empty class [] matches no character, [^] matches all characters (21.2.2.14 ClassRanges :: [empty])
+        if (class_re == nullptr) {
+            class_re = m_is_negated ? util_s.re.mk_full_char(nullptr) : util_s.re.mk_empty(re_sort);
+        } else if (m_is_negated) {
+            // Negated character class -- Sigma - class_re (CharacterSetMatcher with invert = true, 21.2.2.8.1)
+            class_re = mk_char_complement(util_s, class_re);
         }
 
-        return current_class_re;
+        return app_ref(class_re, m);
     }
 
     ASTNodeRef ASTNodeCharClass::clone() const {
@@ -1752,10 +1304,69 @@ namespace smt::noodler::ecma {
     }
 
     // =============== ECMA REGEX PARSER ===============
+    //
+    // Section and production names refer to ECMA-262 2020 (11th edition), 21.2.1 Patterns, with the grammar parameters
+    // fixed to [+U, +N].
+
+    // ---------------- Reading the pattern ----------------
+
+    bool ECMAParser::at_end() const {
+        return m_pos >= m_pattern.length();
+    }
+
+    Z3Char ECMAParser::peek(const std::size_t offset) const {
+        // A value that is not a code point is returned behind the end of the pattern, so it never matches any character
+        if (m_pos + offset >= m_pattern.length()) {
+            return std::numeric_limits<Z3Char>::max();
+        }
+        return m_pattern[m_pos + offset];
+    }
+
+    Z3Char ECMAParser::advance() {
+        SASSERT(!at_end());
+        return m_pattern[m_pos++];
+    }
+
+    bool ECMAParser::eat(const Z3Char ch) {
+        if (!at_end() && peek() == ch) {
+            m_pos++;
+            return true;
+        }
+        return false;
+    }
+
+    void ECMAParser::expect(const Z3Char ch, const char* what) {
+        if (!eat(ch)) {
+            syntax_error(std::string("expected ") + what);
+        }
+    }
+
+    void ECMAParser::syntax_error(const std::string& message, const std::size_t position) const {
+        const std::string full_message =
+            "ECMA regex syntax error at position " + std::to_string(position) + ": " + message;
+        util::throw_error(full_message);
+    }
+
+    void ECMAParser::syntax_error(const std::string& message) const {
+        syntax_error(message, m_pos);
+    }
+
+    // ---------------- Pattern, Disjunction, Alternative, Term ----------------
 
     ASTNodeRef ECMAParser::parse() {
+        m_pos = 0;
+        m_num_capturing_groups = 0;
+        m_named_groups.clear();
+        m_pending_backrefs.clear();
+
+        // Pattern :: Disjunction
         ASTNodeRef ast = parse_disjunction();
-        consume(TokenType::END_OF_INPUT, "Expected end of input");
+        if (!at_end()) {
+            // Disjunction stops only at the end of the pattern or at ')'
+            SASSERT(peek() == ')');
+            syntax_error("unmatched ')'");
+        }
+        resolve_backreferences();
 
         if (debug_mode) {
             namespace fs = std::filesystem;
@@ -1774,285 +1385,643 @@ namespace smt::noodler::ecma {
         return ast;
     }
 
-    void ECMAParser::next() {
-        m_current_token = m_lexer.get_next_token();
-    }
-
-    bool ECMAParser::match(const TokenType type) {
-        if (m_current_token.type == type) {
-            next();
-            return true;
-        }
-        return false;
-    }
-
-    Token ECMAParser::consume(const TokenType type, const char* message) {
-        if (m_current_token.type == type) {
-            const Token t = m_current_token;
-            next();
-            return t;
-        }
-        util::throw_error("Syntax error: " + std::string(message));
-        return {};
+    GroupID ECMAParser::num_capturing_groups() const {
+        return m_num_capturing_groups;
     }
 
     ASTNodeRef ECMAParser::parse_disjunction() {
-        ASTNodeRef alt = parse_alternative();
-
-        if (m_current_token.type != TokenType::ALTERNATION) {
-            return alt;
+        // Disjunction :: Alternative | Alternative '|' Disjunction
+        ASTNodeRef first = parse_alternative();
+        if (peek() != '|') {
+            return first;
         }
 
-        auto disj = std::make_unique<ASTNodeDisjunction>();
-        disj->add_alternative(std::move(alt));
-        while (match(TokenType::ALTERNATION)) {
-            disj->add_alternative(parse_alternative());
+        auto disjunction = std::make_unique<ASTNodeDisjunction>();
+        disjunction->add_alternative(std::move(first));
+        while (eat('|')) {
+            disjunction->add_alternative(parse_alternative());
         }
-        return disj;
+        return disjunction;
     }
 
     ASTNodeRef ECMAParser::parse_alternative() {
-        auto alt = std::make_unique<ASTNodeAlternative>();
-        while (m_current_token.type != TokenType::ALTERNATION && m_current_token.type != TokenType::GROUP_END &&
-               m_current_token.type != TokenType::END_OF_INPUT) {
-            alt->add_term(parse_term());
+        // Alternative :: [empty] | Alternative Term
+        auto alternative = std::make_unique<ASTNodeAlternative>();
+        while (!at_end() && peek() != '|' && peek() != ')') {
+            alternative->add_term(parse_term());
         }
-        return alt;
+        return alternative;
     }
 
     ASTNodeRef ECMAParser::parse_term() {
-        switch (m_current_token.type) {
-            case TokenType::ASSERTION:
-            case TokenType::LOOKAHEAD_POS_START:
-            case TokenType::LOOKAHEAD_NEG_START:
-            case TokenType::LOOKBEHIND_POS_START:
-            case TokenType::LOOKBEHIND_NEG_START:
-                return parse_assertion();
-            case TokenType::LITERAL:
-            case TokenType::DOT:
-            case TokenType::BACKREFERENCE:
-            case TokenType::CHAR_CLASS_ESCAPE:
-            case TokenType::GROUP_START:
-            case TokenType::GROUP_NAMED_START:
-            case TokenType::GROUP_NONCAPTURE_START:
-            case TokenType::CHAR_CLASS_START:
-                return parse_maybe_quantifier(parse_atom());
-            default:
-                util::throw_error("Syntax error in ECMA regex: Unexpected token in term");
-                return {};
+        // Term :: Assertion | Atom | Atom Quantifier
+        //
+        // An assertion cannot be quantified for [+U] (QuantifiableAssertion from B.1.4 is only for [~U]). A quantifier
+        // following an assertion is therefore reported as "nothing to repeat" by parse_atom() of the next term.
+        if (ASTNodeRef assertion = try_parse_assertion()) {
+            return assertion;
         }
+
+        ASTNodeRef atom = parse_atom();
+        Quantifier quantifier;
+        if (!try_parse_quantifier(quantifier)) {
+            return atom;
+        }
+        return std::make_unique<ASTNodeQuantified>(quantifier, std::move(atom));
     }
 
-    ASTNodeRef ECMAParser::parse_maybe_quantifier(ASTNodeRef term) {
-        if (m_current_token.type == TokenType::QUANTIFIER) {
-            const Token t = m_current_token;
-            next();
-
-            auto quant = std::make_unique<ASTNodeQuantifier>();
-            quant->set(t, std::move(term));
-            return quant;
+    ASTNodeRef ECMAParser::try_parse_assertion() {
+        // Assertion :: ^ | $ | \b | \B | (?= Disjunction ) | (?! Disjunction ) | (?<= Disjunction ) | (?<! Disjunction )
+        if (eat('^')) {
+            return std::make_unique<ASTNodeAssertion>(AssertionKind::START);
         }
-        return term;
+        if (eat('$')) {
+            return std::make_unique<ASTNodeAssertion>(AssertionKind::END);
+        }
+        if (peek() == '\\' && (peek(1) == 'b' || peek(1) == 'B')) {
+            const bool is_word_boundary = peek(1) == 'b';
+            m_pos += 2;
+            return std::make_unique<ASTNodeAssertion>(is_word_boundary ? AssertionKind::WORD_BOUNDARY
+                                                                       : AssertionKind::NOT_WORD_BOUNDARY);
+        }
+        if (peek() != '(' || peek(1) != '?') {
+            return nullptr;
+        }
+
+        AssertionKind kind;
+        std::size_t prefix_length;
+        if (peek(2) == '=' || peek(2) == '!') {
+            kind = peek(2) == '=' ? AssertionKind::LOOKAHEAD : AssertionKind::NEG_LOOKAHEAD;
+            prefix_length = 3;
+        } else if (peek(2) == '<' && (peek(3) == '=' || peek(3) == '!')) {
+            kind = peek(3) == '=' ? AssertionKind::LOOKBEHIND : AssertionKind::NEG_LOOKBEHIND;
+            prefix_length = 4;
+        } else {
+            // a group (?: ...) or (?<name> ...)
+            return nullptr;
+        }
+
+        m_pos += prefix_length;
+        ASTNodeRef subpattern = parse_disjunction();
+        expect(')', "')' closing the lookaround");
+        return std::make_unique<ASTNodeAssertion>(kind, std::move(subpattern));
     }
 
-    ASTNodeRef ECMAParser::parse_assertion() {
-        const Token t = m_current_token;
-        auto node = std::make_unique<ASTNodeAssertion>();
-        node->set_type(t.type);
+    // ---------------- Quantifier ----------------
 
-        switch (m_current_token.type) {
-            case TokenType::ASSERTION:
-                SASSERT(std::holds_alternative<Z3Char>(t.payload) && "ASSERTION has no specifier");
-                node->set_payload(std::get<Z3Char>(t.payload));
-                next();
-                return node;
-            case TokenType::LOOKAHEAD_POS_START:
-            case TokenType::LOOKAHEAD_NEG_START:
-            case TokenType::LOOKBEHIND_POS_START:
-            case TokenType::LOOKBEHIND_NEG_START:
-                next();
-                node->set_expr(parse_disjunction());
-                consume(TokenType::GROUP_END, "Expected ')' after lookaround assertion");
-                return node;
-            default:
-                util::throw_error("Syntax error in ECMA regex: Expected assertion");
-                return {};
+    bool ECMAParser::try_parse_quantifier(Quantifier& quantifier) {
+        // Quantifier :: QuantifierPrefix | QuantifierPrefix ?
+        // QuantifierPrefix :: * | + | ? | { DecimalDigits } | { DecimalDigits , } | { DecimalDigits , DecimalDigits }
+        // (semantics in 21.2.2.7)
+        if (eat('*')) {
+            quantifier = {0, UNBOUNDED, true};
+        } else if (eat('+')) {
+            quantifier = {1, UNBOUNDED, true};
+        } else if (eat('?')) {
+            quantifier = {0, 1, true};
+        } else if (peek() == '{') {
+            // There is no fallback to a literal '{' for [+U] (ExtendedPatternCharacter from B.1.4 is only for [~U])
+            const std::size_t start = m_pos;
+            advance();
+            quantifier.min = parse_decimal_digits("the minimum of the {} quantifier");
+            if (eat('}')) {
+                quantifier.max = quantifier.min;
+            } else {
+                expect(',', "',' or '}' in the {} quantifier");
+                quantifier.max = peek() == '}' ? UNBOUNDED : parse_decimal_digits("the maximum of the {} quantifier");
+                expect('}', "'}' closing the {} quantifier");
+            }
+            // Early error (21.2.1.1): the MV of the first DecimalDigits is larger than the MV of the second one
+            if (quantifier.min > quantifier.max) {
+                syntax_error("numbers out of order in {} quantifier", start);
+            }
+            quantifier.greedy = true;
+        } else {
+            return false;
         }
+
+        if (eat('?')) {
+            quantifier.greedy = false;
+        }
+        return true;
     }
+
+    uint64_t ECMAParser::parse_decimal_digits(const char* what) {
+        // DecimalDigits :: DecimalDigit | DecimalDigits DecimalDigit   (MV defined in 11.8.3)
+        if (!is_decimal_digit(peek())) {
+            syntax_error(std::string("expected ") + what);
+        }
+        uint64_t value = 0;
+        while (is_decimal_digit(peek())) {
+            const uint64_t digit = advance() - '0';
+            // UNBOUNDED is reserved for infinity
+            if (value > (UNBOUNDED - 1 - digit) / 10) {
+                util::throw_error("ECMA regex unsupported: number in the {} quantifier is too large");
+            }
+            value = value * 10 + digit;
+        }
+        return value;
+    }
+
+    // ---------------- Atom ----------------
 
     ASTNodeRef ECMAParser::parse_atom() {
-        const Token t = m_current_token;
-        switch (m_current_token.type) {
-            case TokenType::LITERAL: {
-                auto literal = std::make_unique<ASTNodeLiteral>();
-                SASSERT(std::holds_alternative<Z3Char>(t.payload) && "LITERAL has no literal value");
-                literal->set_char(std::get<Z3Char>(t.payload));
-                next();
-                return literal;
-            }
-            case TokenType::DOT:
-                next();
+        // Atom :: PatternCharacter | . | \ AtomEscape | CharacterClass | ( GroupSpecifier Disjunction ) |
+        //         (?: Disjunction )
+        SASSERT(!at_end());
+        switch (peek()) {
+            case '.':
+                advance();
                 return std::make_unique<ASTNodeDot>();
-            case TokenType::BACKREFERENCE: {
-                auto backref = std::make_unique<ASTNodeBackref>();
-                SASSERT(std::holds_alternative<Z3Char>(t.payload) && "BACKREFERENCE payload must be Z3Char");
-                backref->set_ref(std::get<Z3Char>(t.payload));
-                next();
-                return backref;
-            }
-            case TokenType::CHAR_CLASS_ESCAPE: {
-                auto char_class = std::make_unique<ASTNodeCharClass>();
-                SASSERT(std::holds_alternative<Z3Char>(t.payload) && "CHAR_CLASS_ESCAPE has no class specifier");
-                const CharClassElement elem {.kind = ElementType::ESCAPE, .lower = std::get<Z3Char>(t.payload)};
-                char_class->add_element(elem);
-                next();
-                return char_class;
-            }
-            case TokenType::GROUP_START:
-            case TokenType::GROUP_NAMED_START:
-            case TokenType::GROUP_NONCAPTURE_START:
-                return parse_group();
-            case TokenType::CHAR_CLASS_START:
+            case '\\':
+                advance();
+                return parse_atom_escape();
+            case '[':
                 return parse_character_class();
+            case '(':
+                return parse_group();
+            case '*':
+            case '+':
+            case '?':
+            case '{':
+                syntax_error("nothing to repeat");
+            case ']':
+            case '}':
+                // SyntaxCharacter is not a PatternCharacter (Annex B allows lone ']' and '}' only for [~U])
+                syntax_error(std::string("lone '") + static_cast<char>(peek()) + "' must be escaped");
             default:
-                util::throw_error("Syntax error in ECMA regex: Unexpected token in atom");
-                return {};
+                // PatternCharacter :: SourceCharacter but not SyntaxCharacter
+                // ('^', '$', '|' and ')' were already handled by parse_term/parse_alternative)
+                SASSERT(!is_syntax_character(peek()));
+                return std::make_unique<ASTNodeCharacter>(advance());
         }
     }
 
     ASTNodeRef ECMAParser::parse_group() {
-        const Token t = m_current_token;
-        auto group = std::make_unique<ASTNodeGroup>();
+        // Atom :: ( GroupSpecifier Disjunction ) | (?: Disjunction )
+        // GroupSpecifier :: [empty] | ? GroupName
+        // (lookarounds starting with "(?" were already handled by try_parse_assertion)
+        const std::size_t start = m_pos;
+        advance();
 
-        switch (m_current_token.type) {
-            case TokenType::GROUP_START:
-                group->set_type(GroupType::CAPTURE);
-                break;
-            case TokenType::GROUP_NAMED_START:
-                group->set_type(GroupType::NAMED);
-                SASSERT(std::holds_alternative<zstring_view>(t.payload) && "GROUP_NAMED_START has no name");
-                break;
-            case TokenType::GROUP_NONCAPTURE_START:
-                group->set_type(GroupType::NONCAPTURE);
-                break;
-            default:
-                util::throw_error("Syntax error in ECMA regex: Expected group start");
+        if (eat('?')) {
+            if (eat(':')) {
+                ASTNodeRef child = parse_disjunction();
+                expect(')', "')' closing the group");
+                return std::make_unique<ASTNodeGroup>(std::move(child));
+            }
+            if (peek() != '<') {
+                syntax_error("invalid group, expected one of '(?:', '(?=', '(?!', '(?<=', '(?<!' or '(?<name>'", start);
+            }
+            const std::size_t name_position = m_pos;
+            zstring_view name_source;
+            const zstring name = parse_group_name(name_source);
+            // The group number is the number of left-capturing parentheses to the left (parenIndex, 21.2.2.8)
+            const GroupID gid = create_capturing_group();
+            register_group_name(name, gid, name_position);
+            ASTNodeRef child = parse_disjunction();
+            expect(')', "')' closing the group");
+            return std::make_unique<ASTNodeGroup>(gid, std::move(child), name_source);
         }
 
-        if (m_current_token.type != TokenType::GROUP_NONCAPTURE_START) {
-            m_current_group_id++;
-            group->set_id(m_current_group_id);
-        }
-
-        next();
-        group->set_expr(parse_disjunction());
-        consume(TokenType::GROUP_END, "Expected ')' after group");
-        return group;
+        const GroupID gid = create_capturing_group();
+        ASTNodeRef child = parse_disjunction();
+        expect(')', "')' closing the group");
+        return std::make_unique<ASTNodeGroup>(gid, std::move(child));
     }
 
+    // ---------------- AtomEscape, CharacterEscape ----------------
+
+    ASTNodeRef ECMAParser::parse_atom_escape() {
+        // AtomEscape :: DecimalEscape | CharacterClassEscape | CharacterEscape | k GroupName
+        // (the backslash is already consumed; \b and \B were handled by try_parse_assertion)
+        const std::size_t start = m_pos - 1;
+        if (at_end()) {
+            syntax_error("\\ at end of pattern", start);
+        }
+
+        // DecimalEscape :: NonZeroDigit DecimalDigits_opt [lookahead ∉ DecimalDigit]
+        // For [+U], it is always a backreference (no legacy octal escapes from B.1.4).
+        if (peek() >= '1' && peek() <= '9') {
+            // CapturingGroupNumber (21.2.1.2), saturated -- a too large number is reported as an early error later
+            GroupID number = 0;
+            while (is_decimal_digit(peek())) {
+                const GroupID digit = advance() - '0';
+                number = number > (std::numeric_limits<GroupID>::max() - digit) / 10
+                             ? std::numeric_limits<GroupID>::max()
+                             : number * 10 + digit;
+            }
+            auto backref = std::make_unique<ASTNodeBackreference>(number);
+            m_pending_backrefs.push_back({backref.get(), start, zstring()});
+            return backref;
+        }
+
+        // [+N] k GroupName
+        if (eat('k')) {
+            if (peek() != '<') {
+                syntax_error("invalid named reference, expected '\\k<name>'", start);
+            }
+            zstring_view name_source;
+            zstring name = parse_group_name(name_source);
+            auto backref = std::make_unique<ASTNodeBackreference>(0, name_source);
+            m_pending_backrefs.push_back({backref.get(), start, std::move(name)});
+            return backref;
+        }
+
+        CharClassEscape escape;
+        if (try_parse_character_class_escape(escape)) {
+            auto char_class = std::make_unique<ASTNodeCharClass>(false);
+            char_class->add_item(std::move(escape));
+            return char_class;
+        }
+
+        return std::make_unique<ASTNodeCharacter>(parse_character_escape());
+    }
+
+    Z3Char ECMAParser::parse_character_escape() {
+        // CharacterEscape[U] :: ControlEscape | c ControlLetter | 0 [lookahead ∉ DecimalDigit] | HexEscapeSequence |
+        //                       RegExpUnicodeEscapeSequence[?U] | IdentityEscape[?U]
+        // Returns the CharacterValue (21.2.1.4). The backslash is already consumed.
+        const std::size_t start = m_pos - 1;
+        if (at_end()) {
+            syntax_error("\\ at end of pattern", start);
+        }
+
+        const Z3Char ch = advance();
+        switch (ch) {
+            // ControlEscape :: one of f n r t v   (Table 54)
+            case 't':
+                return 0x0009;
+            case 'n':
+                return 0x000A;
+            case 'v':
+                return 0x000B;
+            case 'f':
+                return 0x000C;
+            case 'r':
+                return 0x000D;
+            case 'c':
+                // c ControlLetter -- the remainder of dividing the code point by 32
+                if (!is_ascii_letter(peek())) {
+                    syntax_error("invalid control escape, expected '\\c' followed by an ASCII letter", start);
+                }
+                return advance() % 32;
+            case '0':
+                // 0 [lookahead ∉ DecimalDigit] -- for [+U], legacy octal escapes (B.1.4) are not allowed
+                if (is_decimal_digit(peek())) {
+                    syntax_error("invalid decimal escape (octal escapes are not allowed)", start);
+                }
+                return 0x0000;
+            case 'x': {
+                // HexEscapeSequence :: x HexDigit HexDigit   (11.8.4)
+                if (!is_hex_digit(peek()) || !is_hex_digit(peek(1))) {
+                    syntax_error("invalid hexadecimal escape, expected '\\x' followed by two hex digits", start);
+                }
+                const Z3Char high = hex_digit_value(advance());
+                return high * 16 + hex_digit_value(advance());
+            }
+            case 'u':
+                return parse_regexp_unicode_escape_sequence();
+            default:
+                // IdentityEscape[+U] :: [+U] SyntaxCharacter | [+U] /
+                if (is_syntax_character(ch) || ch == '/') {
+                    return ch;
+                }
+                syntax_error("invalid escape", start);
+        }
+    }
+
+    Z3Char ECMAParser::parse_regexp_unicode_escape_sequence() {
+        // RegExpUnicodeEscapeSequence[+U] :: u LeadSurrogate \u TrailSurrogate | u LeadSurrogate | u TrailSurrogate |
+        //                                    u NonSurrogate | u{ CodePoint }
+        // The "\u" is already consumed.
+        const std::size_t start = m_pos - 2;
+
+        if (eat('{')) {
+            // CodePoint :: HexDigits but only if MV of HexDigits ≤ 0x10FFFF   (11.8.6)
+            if (!is_hex_digit(peek())) {
+                syntax_error("invalid unicode escape, expected hex digits after '\\u{'", start);
+            }
+            uint32_t value = 0;
+            while (is_hex_digit(peek())) {
+                value = value * 16 + hex_digit_value(advance());
+                if (value > MAX_CODE_POINT) {
+                    syntax_error("invalid unicode escape, code point is larger than 0x10FFFF", start);
+                }
+            }
+            expect('}', "'}' closing the unicode escape");
+            return value;
+        }
+
+        Z3Char lead = 0;
+        if (!try_parse_hex4_digits(0, lead)) {
+            syntax_error("invalid unicode escape, expected '\\u' followed by four hex digits or '\\u{...}'", start);
+        }
+        m_pos += 4;
+
+        // A lead surrogate followed by an escaped trail surrogate forms a single code point (UTF16DecodeSurrogatePair,
+        // 10.1.3). Each \u TrailSurrogate is associated with the nearest preceding u LeadSurrogate.
+        Z3Char trail = 0;
+        if (is_lead_surrogate(lead) && peek() == '\\' && peek(1) == 'u' && try_parse_hex4_digits(2, trail) &&
+            is_trail_surrogate(trail)) {
+            m_pos += 6;
+            return (lead - 0xD800) * 0x400 + (trail - 0xDC00) + 0x10000;
+        }
+        return lead;
+    }
+
+    bool ECMAParser::try_parse_hex4_digits(const std::size_t offset, Z3Char& value) const {
+        // Hex4Digits :: HexDigit HexDigit HexDigit HexDigit   (11.8.4)
+        value = 0;
+        for (std::size_t i = 0; i < 4; i++) {
+            if (!is_hex_digit(peek(offset + i))) {
+                return false;
+            }
+            value = value * 16 + hex_digit_value(peek(offset + i));
+        }
+        return true;
+    }
+
+    // ---------------- CharacterClassEscape ----------------
+
+    bool ECMAParser::try_parse_character_class_escape(CharClassEscape& escape) {
+        // CharacterClassEscape[U] :: d | D | s | S | w | W | [+U] p{ UnicodePropertyValueExpression } |
+        //                            [+U] P{ UnicodePropertyValueExpression }
+        switch (peek()) {
+            case 'd':
+                escape.kind = ClassEscapeKind::DIGIT;
+                break;
+            case 'D':
+                escape.kind = ClassEscapeKind::NOT_DIGIT;
+                break;
+            case 's':
+                escape.kind = ClassEscapeKind::SPACE;
+                break;
+            case 'S':
+                escape.kind = ClassEscapeKind::NOT_SPACE;
+                break;
+            case 'w':
+                escape.kind = ClassEscapeKind::WORD;
+                break;
+            case 'W':
+                escape.kind = ClassEscapeKind::NOT_WORD;
+                break;
+            case 'p':
+            case 'P':
+                escape.kind = peek() == 'p' ? ClassEscapeKind::PROPERTY : ClassEscapeKind::NOT_PROPERTY;
+                advance();
+                parse_unicode_property_value_expression(escape);
+                return true;
+            default:
+                return false;
+        }
+        advance();
+        return true;
+    }
+
+    void ECMAParser::parse_unicode_property_value_expression(CharClassEscape& escape) {
+        // UnicodePropertyValueExpression :: UnicodePropertyName = UnicodePropertyValue |
+        //                                   LoneUnicodePropertyNameOrValue
+        // UnicodePropertyNameCharacter :: ControlLetter | _
+        // UnicodePropertyValueCharacter :: UnicodePropertyNameCharacter | DecimalDigit
+        const std::size_t start = m_pos - 2;
+        expect('{', "'{' after '\\p' or '\\P'");
+
+        auto is_name_char = [](const Z3Char ch) {
+            return is_ascii_letter(ch) || ch == '_';
+        };
+        // The name and value are views into the pattern
+        auto read_value_chars = [&]() {
+            const std::size_t begin = m_pos;
+            while (is_name_char(peek()) || is_decimal_digit(peek())) {
+                advance();
+            }
+            return zstring_view(m_pattern + static_cast<uint32_t>(begin), static_cast<uint32_t>(m_pos - begin));
+        };
+        auto is_property_name = [&](const zstring_view chars) {
+            for (uint32_t i = 0; i < chars.length(); i++) {
+                if (!is_name_char(chars[i])) {
+                    return false;
+                }
+            }
+            return chars.length() > 0;
+        };
+
+        const zstring_view first = read_value_chars();
+        if (eat('=')) {
+            if (!is_property_name(first)) {
+                syntax_error("invalid Unicode property name", start);
+            }
+            const zstring_view value = read_value_chars();
+            if (value.length() == 0) {
+                syntax_error("invalid Unicode property value", start);
+            }
+            expect('}', "'}' closing the Unicode property escape");
+
+            // Early errors (21.2.1.1): the name must be listed in Table 55, the value in Table 57 or Table 58
+            bool is_known_value;
+            if (contains_name(PROPERTY_GENERAL_CATEGORY, first)) {
+                is_known_value = contains_name(GENERAL_CATEGORY_VALUES, value);
+            } else if (contains_name(PROPERTY_SCRIPT, first)) {
+                is_known_value = contains_name(SCRIPT_VALUES, value);
+            } else {
+                syntax_error("unknown Unicode property name '" + first.to_zstring().encode() + "'", start);
+                return;
+            }
+            if (!is_known_value) {
+                syntax_error("unknown value '" + value.to_zstring().encode() + "' of the Unicode property '" +
+                                 first.to_zstring().encode() + "'",
+                             start);
+            }
+            escape.property_name = first;
+            escape.property_value = value;
+            return;
+        }
+
+        if (first.length() == 0) {
+            syntax_error("invalid Unicode property escape", start);
+        }
+        expect('}', "'}' closing the Unicode property escape");
+        // Early error (21.2.1.1): a lone name must be a General_Category value (Table 57) or a binary property
+        // (Table 56)
+        if (!contains_name(GENERAL_CATEGORY_VALUES, first) && !contains_name(BINARY_PROPERTIES, first)) {
+            syntax_error("unknown Unicode property '" + first.to_zstring().encode() + "'", start);
+        }
+        escape.property_value = first;
+    }
+
+    // ---------------- GroupName ----------------
+
+    zstring ECMAParser::parse_group_name(zstring_view& source_text) {
+        // GroupName[U] :: < RegExpIdentifierName[?U] >
+        // RegExpIdentifierName[U] :: RegExpIdentifierStart[?U] | RegExpIdentifierName[?U] RegExpIdentifierPart[?U]
+        // Returns the StringValue of the name (21.2.1.6), i.e., with the escape sequences replaced. The source text of
+        // RegExpIdentifierName (a view into the pattern) is stored to @p source_text.
+        expect('<', "'<' starting the group name");
+        if (peek() == '>') {
+            syntax_error("empty group name");
+        }
+
+        const std::size_t begin = m_pos;
+        zstring name(parse_regexp_identifier_char(true));
+        while (peek() != '>') {
+            if (at_end()) {
+                syntax_error("unterminated group name, expected '>'");
+            }
+            name += zstring(parse_regexp_identifier_char(false));
+        }
+        source_text = zstring_view(m_pattern + static_cast<uint32_t>(begin), static_cast<uint32_t>(m_pos - begin));
+        advance();  // '>'
+        return name;
+    }
+
+    Z3Char ECMAParser::parse_regexp_identifier_char(const bool is_start) {
+        // RegExpIdentifierStart[U] :: UnicodeIDStart | $ | _ | \ RegExpUnicodeEscapeSequence[+U]
+        // RegExpIdentifierPart[U] :: UnicodeIDContinue | $ | \ RegExpUnicodeEscapeSequence[+U] | <ZWNJ> | <ZWJ>
+        //
+        // Only the ASCII part of UnicodeIDStart/UnicodeIDContinue is checked, non-ASCII characters are accepted.
+        // The early errors (21.2.1.1) require the same restrictions on the escaped characters.
+        const std::size_t start = m_pos;
+        if (at_end()) {
+            syntax_error("unterminated group name, expected '>'");
+        }
+        Z3Char ch;
+        if (eat('\\')) {
+            if (!eat('u')) {
+                syntax_error("invalid escape in group name, only '\\u' escapes are allowed", start);
+            }
+            ch = parse_regexp_unicode_escape_sequence();
+        } else {
+            ch = advance();
+        }
+
+        bool is_valid = ch == '$' || ch == '_' || is_ascii_letter(ch) || ch >= 0x80;
+        if (!is_start) {
+            is_valid = is_valid || is_decimal_digit(ch) || ch == CH_ZWNJ || ch == CH_ZWJ;
+        }
+        if (!is_valid) {
+            syntax_error("invalid character in group name", start);
+        }
+        return ch;
+    }
+
+    // ---------------- CharacterClass ----------------
+
     ASTNodeRef ECMAParser::parse_character_class() {
-        consume(TokenType::CHAR_CLASS_START, "Expected '['");
-
-        auto char_class = std::make_unique<ASTNodeCharClass>();
-        char_class->set_negation(match(TokenType::CHAR_CLASS_NEGATION));
-
-        parse_class_ranges(char_class);
-        consume(TokenType::CHAR_CLASS_END, "Expected ']'");
+        // CharacterClass[U] :: [ [lookahead ≠ ^] ClassRanges[?U] ] | [ ^ ClassRanges[?U] ]
+        advance();
+        auto char_class = std::make_unique<ASTNodeCharClass>(eat('^'));
+        parse_class_ranges(*char_class);
+        expect(']', "']' closing the character class");
         return char_class;
     }
 
-    void ECMAParser::add_atom_to_class(const ASTNodeCharClassRef& char_class_parent, const CharClassAtom atom) {
-        if (atom.is_escape) {
-            char_class_parent->add_element({.kind = ElementType::ESCAPE, .lower = atom.val});
-        } else {
-            char_class_parent->add_element({.kind = ElementType::SINGLE, .lower = atom.val});
-        }
-    }
+    void ECMAParser::parse_class_ranges(ASTNodeCharClass& char_class) {
+        // ClassRanges :: [empty] | NonemptyClassRanges
+        // NonemptyClassRanges :: ClassAtom | ClassAtom NonemptyClassRangesNoDash | ClassAtom - ClassAtom ClassRanges
+        // NonemptyClassRangesNoDash :: ClassAtom | ClassAtomNoDash NonemptyClassRangesNoDash |
+        //                              ClassAtomNoDash - ClassAtom ClassRanges
+        //
+        // The productions are equivalent to the loop below: a '-' between two atoms forms a range, otherwise it is
+        // a literal '-' (at the beginning, at the end, or right after a range).
+        while (!at_end() && peek() != ']') {
+            const std::size_t start = m_pos;
+            ClassAtom first = parse_class_atom();
 
-    void ECMAParser::parse_class_ranges(const ASTNodeCharClassRef& char_class_parent) {
-        if (m_current_token.type == TokenType::LITERAL || m_current_token.type == TokenType::CHAR_CLASS_ESCAPE ||
-            m_current_token.type == TokenType::CHAR_CLASS_RANGE) {
-            const CharClassAtom first_atom = parse_class_atom();
-            parse_class_ranges_tail(char_class_parent, first_atom);
-        }
-    }
-
-    void ECMAParser::parse_class_ranges_tail(const ASTNodeCharClassRef& char_class_parent,
-                                             const CharClassAtom prev_atom) {
-        switch (m_current_token.type) {
-            case TokenType::CHAR_CLASS_RANGE:
-                next();  // skip '-'
-                parse_dash_tail(char_class_parent, prev_atom);
-                parse_class_ranges(char_class_parent);
-                break;
-            case TokenType::LITERAL:
-            case TokenType::CHAR_CLASS_ESCAPE: {
-                add_atom_to_class(char_class_parent, prev_atom);
-                const CharClassAtom next_atom = parse_class_atom_no_dash();
-                parse_class_ranges_tail(char_class_parent, next_atom);
-                break;
-            }
-            default:  // epsilon
-                add_atom_to_class(char_class_parent, prev_atom);
-                break;
-        }
-    }
-
-    void ECMAParser::parse_dash_tail(const ASTNodeCharClassRef& char_class, const CharClassAtom atom_before_dash) {
-        switch (m_current_token.type) {
-            case TokenType::CHAR_CLASS_ESCAPE: {
-                util::throw_error("ECMA Regex error: Character class as a bound of range");
-                break;
-            }
-            case TokenType::CHAR_CLASS_RANGE:
-                char_class->add_element({.kind = ElementType::RANGE, .lower = atom_before_dash.val, .upper = '-'});
-                next();
-                break;
-            case TokenType::LITERAL: {
-                if (atom_before_dash.is_escape) {
-                    util::throw_error("ECMA Regex Error: Character class as a bound of range");
+            if (peek() != '-' || peek(1) == ']' || m_pos + 1 >= m_pattern.length()) {
+                if (first.is_class) {
+                    char_class.add_item(std::move(first.escape));
+                } else {
+                    char_class.add_item(ClassRange {first.value, first.value});
                 }
-                SASSERT(std::holds_alternative<Z3Char>(m_current_token.payload) && "LITERAL has no literal value");
-                const Z3Char from = atom_before_dash.val;
-                const Z3Char to = std::get<Z3Char>(m_current_token.payload);
-                char_class->add_element({.kind = ElementType::RANGE, .lower = from, .upper = to});
-                next();
-                break;
+                continue;
             }
-            default:  // epsilon
-                add_atom_to_class(char_class, atom_before_dash);
-                char_class->add_element({ElementType::SINGLE, static_cast<Z3Char>('-'), 0});
-                break;
+
+            advance();  // '-'
+            ClassAtom second = parse_class_atom();
+            // Early errors (21.2.1.1, IsCharacterClass in 21.2.1.3, CharacterValue in 21.2.1.4)
+            if (first.is_class || second.is_class) {
+                syntax_error("invalid character class range, a class escape cannot be a bound of a range", start);
+            }
+            if (first.value > second.value) {
+                syntax_error("range out of order in character class", start);
+            }
+            char_class.add_item(ClassRange {first.value, second.value});
         }
     }
 
-    CharClassAtom ECMAParser::parse_class_atom() {
-        switch (m_current_token.type) {
-            case TokenType::LITERAL:
-            case TokenType::CHAR_CLASS_ESCAPE:
-                return parse_class_atom_no_dash();
-            case TokenType::CHAR_CLASS_RANGE:
-                next();
-                return {false, static_cast<Z3Char>('-')};
-            default:
-                util::throw_error("Syntax error in ECMA regex: Expected class atom");
-                return {};
+    ECMAParser::ClassAtom ECMAParser::parse_class_atom() {
+        // ClassAtom[U] :: - | ClassAtomNoDash[?U]
+        // ClassAtomNoDash[U] :: SourceCharacter but not one of \ or ] or - | \ ClassEscape[?U]
+        SASSERT(!at_end() && peek() != ']');
+        if (eat('\\')) {
+            return parse_class_escape();
         }
+        ClassAtom atom;
+        atom.value = advance();
+        return atom;
     }
 
-    CharClassAtom ECMAParser::parse_class_atom_no_dash() {
-        const Token current_token = m_current_token;
-        next();
-        switch (current_token.type) {
-            case TokenType::LITERAL:
-                SASSERT(std::holds_alternative<Z3Char>(current_token.payload));
-                return {false, std::get<Z3Char>(current_token.payload)};
-            case TokenType::CHAR_CLASS_ESCAPE:
-                SASSERT(std::holds_alternative<Z3Char>(current_token.payload));
-                return {true, std::get<Z3Char>(current_token.payload)};
-            default:
-                util::throw_error("Syntax error in ECMA regex: Expected literal or escape sequence");
-                return {};
+    ECMAParser::ClassAtom ECMAParser::parse_class_escape() {
+        // ClassEscape[U] :: b | [+U] - | CharacterClassEscape[?U] | CharacterEscape[?U]
+        // The backslash is already consumed.
+        ClassAtom atom;
+        if (eat('b')) {
+            atom.value = CH_BACKSPACE;
+            return atom;
+        }
+        if (eat('-')) {
+            atom.value = '-';
+            return atom;
+        }
+        if (try_parse_character_class_escape(atom.escape)) {
+            atom.is_class = true;
+            return atom;
+        }
+        atom.value = parse_character_escape();
+        return atom;
+    }
+
+    // ---------------- Capturing groups and backreferences ----------------
+
+    GroupID ECMAParser::create_capturing_group() {
+        // Early error (21.2.1.1): NcapturingParens ≥ 2^32 - 1
+        if (m_num_capturing_groups >= std::numeric_limits<GroupID>::max() - 1) {
+            syntax_error("too many capturing groups");
+        }
+        return ++m_num_capturing_groups;
+    }
+
+    void ECMAParser::register_group_name(const zstring& name, const GroupID gid, const std::size_t position) {
+        // Early error (21.2.1.1): multiple GroupSpecifiers with the same StringValue of their names
+        for (const NamedGroup& group : m_named_groups) {
+            if (group.name == name) {
+                syntax_error("duplicate capture group name", position);
+            }
+        }
+        m_named_groups.push_back({name, gid});
+    }
+
+    void ECMAParser::resolve_backreferences() {
+        for (const auto& [backref, position, name] : m_pending_backrefs) {
+            if (name.empty()) {
+                // Early error (21.2.1.1): CapturingGroupNumber of DecimalEscape is larger than NcapturingParens
+                if (backref->get_group_id() > m_num_capturing_groups) {
+                    syntax_error("reference to non-existent group \\" + std::to_string(backref->get_group_id()),
+                                 position);
+                }
+                continue;
+            }
+
+            // Early error (21.2.1.1): \k GroupName must refer to some GroupSpecifier of the pattern
+            const zstring& group_name = name;
+            const auto group = std::find_if(m_named_groups.begin(), m_named_groups.end(), [&](const NamedGroup& g) {
+                return g.name == group_name;
+            });
+            if (group == m_named_groups.end()) {
+                syntax_error("reference to undefined group name", position);
+            }
+            backref->set_group_id(group->gid);
         }
     }
 
