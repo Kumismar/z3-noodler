@@ -3666,8 +3666,8 @@ br_status seq_rewriter::mk_str_in_regexp(expr* a, expr* b, expr_ref& result) {
     STRACE(seq_verbose, tout << "mk_str_in_regexp: " << mk_pp(a, m())
                                << ", " << mk_pp(b, m()) << std::endl;);
 
-    // the ECMA regexes cannot be derived, just return fail and don't try to derive them
-    if (re().is_from_ecma2020(b)) {
+    // the extended regexes (re.from_regex) cannot be derived, just return fail and don't try to derive them
+    if (re().is_from_regex(b)) {
         return BR_FAILED;
     }
 

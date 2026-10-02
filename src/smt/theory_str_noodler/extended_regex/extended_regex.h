@@ -5,6 +5,8 @@
 #include "util/zstring_view.h"
 
 #include <memory>
+#include <optional>
+#include <string_view>
 
 // Interface of the extended regexes. Each regex flavor has its own frontend (a parser into the common AST) in
 // extended_regex/frontend/ and its own nested namespace (e.g. extended_regex::ecma). All the flavors share the backend
@@ -14,7 +16,7 @@ namespace smt::noodler::extended_regex {
      * Supported flavors of extended regexes.
      */
     enum class RegexFlavor {
-        ECMA2020,  // re.from_ecma2020
+        ECMA2020,  // (_ re.from_regex ecma2020), alias re.from_ecma2020
     };
 
     /**
@@ -66,4 +68,12 @@ namespace smt::noodler::extended_regex {
      * @return std::unique_ptr<ExtendedRegex> The regex of the given flavor.
      */
     std::unique_ptr<ExtendedRegex> make_extended_regex(RegexFlavor flavor, const zstring& pattern);
+
+    /**
+     * @brief Get the flavor named @p name in (_ re.from_regex name).
+     *
+     * @param name The flavor symbol from the SMT-LIB input (e.g. "ecma2020").
+     * @return std::optional<RegexFlavor> The flavor, or std::nullopt if no flavor of that name is supported.
+     */
+    std::optional<RegexFlavor> regex_flavor_from_name(const std::string& name);
 }  // namespace smt::noodler::extended_regex

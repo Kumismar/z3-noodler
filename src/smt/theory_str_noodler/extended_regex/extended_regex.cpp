@@ -19,4 +19,11 @@ namespace smt::noodler::extended_regex {
         util::throw_error("Extended regex: unknown regex flavor");
         return nullptr;
     }
+
+    std::optional<RegexFlavor> regex_flavor_from_name(const std::string& name) {
+        if (name == "ecma2020") {
+            return RegexFlavor::ECMA2020;
+        }
+        return std::nullopt;
+    }
 }  // namespace smt::noodler::extended_regex

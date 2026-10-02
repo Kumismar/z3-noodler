@@ -255,8 +255,8 @@ void seq_decl_plugin::init() {
     m_sigs[OP_SEQ_REPLACE_RE]    = alloc(psig, m, "str.replace_re", 1, 3, seqAreAseqA, seqA);
     m_sigs[OP_SEQ_REPLACE_ALL]   = alloc(psig, m, "str.replace_all", 1, 3, seqAseqAseqA, seqA);
     m_sigs[OP_STRING_CONST]      = nullptr;
-    // Support both parameterized-const (arity=0, zstring parameter) and unary form (String -> RegEx(String))
-    m_sigs[OP_RE_FROM_ECMA2020]  = alloc(psig, m, "re.from_ecma2020", 0, 1, &strT, reT);
+    m_sigs[OP_RE_FROM_REGEX]     = alloc(psig, m, "re.from_regex", 0, 1, &strT, reT);
+    m_sigs[_OP_RE_FROM_ECMA2020] = alloc(psig, m, "re.from_ecma2020", 0, 1, &strT, reT);
     m_sigs[_OP_STRING_STRIDOF]   = alloc(psig, m, "str.indexof", 0, 3, str2TintT, intT);
     m_sigs[_OP_STRING_STRREPL]   = alloc(psig, m, "str.replace", 0, 3, str3T, strT);
     m_sigs[_OP_STRING_FROM_CHAR] = alloc(psig, m, "char", 1, 0, nullptr, strT);
@@ -456,7 +456,6 @@ func_decl* seq_decl_plugin::mk_func_decl(decl_kind k, unsigned num_parameters, p
     case OP_RE_COMPLEMENT:
     case OP_RE_REVERSE:
     case OP_RE_DERIVATIVE:
-    case OP_RE_FROM_ECMA2020:
         m_has_re = true;
         Z3_fallthrough;   
     case OP_SEQ_UNIT:
@@ -557,6 +556,24 @@ func_decl* seq_decl_plugin::mk_func_decl(decl_kind k, unsigned num_parameters, p
         default:
             m.raise_exception("Incorrect number of arguments passed to loop. Expected 1 regular expression and two integer parameters");
         }
+    case OP_RE_FROM_REGEX:
+        m_has_re = true;
+        if (num_parameters != 1 || !parameters[0].is_symbol()) {
+            m.raise_exception("Incorrect parameters used for re.from_regex. Expected one symbol parameter naming the regex flavor, e.g. (_ re.from_regex ecma2020)");
+        }
+        match(*m_sigs[k], arity, domain, range, rng);
+        return m.mk_func_decl(m_sigs[k]->m_name, arity, domain, rng, func_decl_info(m_family_id, k, num_parameters, parameters));
+
+    case _OP_RE_FROM_ECMA2020: {
+        m_has_re = true;
+        if (num_parameters != 0) {
+            m.raise_exception("re.from_ecma2020 does not take parameters");
+        }
+        match(*m_sigs[k], arity, domain, range, rng);
+        parameter flavor(symbol("ecma2020"));
+        return m.mk_func_decl(m_sigs[OP_RE_FROM_REGEX]->m_name, arity, domain, rng, func_decl_info(m_family_id, OP_RE_FROM_REGEX, 1, &flavor));
+    }
+
     case OP_RE_POWER:
         m_has_re = true;
         if (num_parameters == 1 && parameters[0].is_int() && arity == 1 && parameters[0].get_int() >= 0) {
@@ -1404,6 +1421,18 @@ bool seq_util::rex::is_loop(expr const* n, expr*& body, expr*& lo) const {
         if (a->get_num_args() == 2) {
             body = a->get_arg(0);
             lo = a->get_arg(1);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool seq_util::rex::is_from_regex(expr const* n, symbol& flavor, expr*& s) const {
+    if (is_from_regex(n)) {
+        app const* a = to_app(n);
+        if (a->get_num_parameters() == 1 && a->get_decl()->get_parameter(0).is_symbol()) {
+            flavor = a->get_decl()->get_parameter(0).get_symbol();
+            s = a->get_arg(0);
             return true;
         }
     }

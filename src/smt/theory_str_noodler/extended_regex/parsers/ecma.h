@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-// Frontend for ECMAScript regexes (re.from_ecma2020), following ECMA-262 2020 (11th edition), section 21.2.
+// Frontend for ECMAScript regexes ((_ re.from_regex ecma2020), alias re.from_ecma2020), following ECMA-262 2020 (11th edition), section 21.2.
 namespace smt::noodler::extended_regex::ecma {
     /**
      * @brief Convert utf-8 @p raw_input into a sanitized form where each Z3Char (uint32_t) represents a single Unicode

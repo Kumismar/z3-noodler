@@ -498,7 +498,7 @@ namespace smt::noodler {
             m_util_s.str.is_from_code(n) // str.from_code
         ) {
             handle_conversion(n);
-        } else if (m_util_s.str.is_in_re_from_ecma2020(n)) { // str.in_re with re.from_ecma2020
+        } else if (m_util_s.str.is_in_re_from_regex(n)) { // str.in_re with (_ re.from_regex flavor)
             handle_extended_re(n);
         } else if (util::is_str_variable(n, m_util_s)) {
             BasicTerm var_for_n = util::get_variable_basic_term(n);
@@ -2239,18 +2239,21 @@ namespace smt::noodler {
     void theory_str_noodler::handle_extended_re(expr* e) {
         // Determine the flavor of the extended regex from the regex operator
         expr* x = nullptr;
+        symbol flavor_name;
         zstring pattern;
         using namespace extended_regex;
-        RegexFlavor flavor;
-        if (m_util_s.str.is_in_re_from_ecma2020(e, x, pattern)) {
-            flavor = RegexFlavor::ECMA2020;
-        } else {
-            util::throw_error("We can only handle (str.in_re ... (re.from_ecma2020 pattern)) with a constant pattern");
+        if (!m_util_s.str.is_in_re_from_regex(e, x, flavor_name, pattern)) {
+            util::throw_error("We can only handle (str.in_re ... ((_ re.from_regex flavor) pattern)) with a constant pattern");
+            return;
+        }
+        const std::optional<RegexFlavor> flavor = regex_flavor_from_name(flavor_name.str());
+        if (!flavor.has_value()) {
+            util::throw_error("Unsupported regex flavor '" + flavor_name.str() + "' in re.from_regex (supported: ecma2020)");
             return;
         }
 
         // The regex must outlive the builder
-        const std::unique_ptr<ExtendedRegex> regex = make_extended_regex(flavor, pattern);
+        const std::unique_ptr<ExtendedRegex> regex = make_extended_regex(*flavor, pattern);
         RegexConstraintBuilder builder(m, *regex, m_params);
         builder.build_rcg();
 
@@ -2333,9 +2336,9 @@ namespace smt::noodler {
         expr *s = nullptr, *re = nullptr;
         VERIFY(m_util_s.str.is_in_re(e, s, re));
 
-        // Memberships over (re.from_ecma2020 ...) are handled via axioms that relate them
+        // Memberships over ((_ re.from_regex flavor) ...) are handled via axioms that relate them
         // to (str.to_re ...) and should not be sent to the decision procedure.
-        if (m_util_s.re.is_from_ecma2020(re))
+        if (m_util_s.re.is_from_regex(re))
             return;
 
         app_ref re_constr(to_app(s), m);
