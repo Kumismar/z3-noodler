@@ -1,4 +1,5 @@
-#include "smt/theory_str_noodler/ecma_regex.h"
+#include "smt/theory_str_noodler/extended_regex/backend.h"
+#include "smt/theory_str_noodler/extended_regex/parsers/ecma.h"
 
 #include "ast/ast.h"
 #include "ast/ast_pp.h"
@@ -14,7 +15,7 @@
 #include <vector>
 
 // Section numbers in the comments refer to ECMA-262 2020.
-namespace smt::noodler::ecma::test {
+namespace smt::noodler::extended_regex::test {
     // Converts ASCII @p text to a zstring character by character. Unlike zstring(const char*), it does not decode
     // the "\u" escape sequences, so they are kept for the ECMA regex parser.
     zstring raw(const std::string& text) {
@@ -38,7 +39,7 @@ namespace smt::noodler::ecma::test {
     }
 
     std::string parse_and_serialize(const zstring& pattern) {
-        ECMAParser parser(pattern);
+        ecma::ECMAParser parser(pattern);
         const ASTNodeRef root = parser.parse();
         return root->serialize().encode();
     }
@@ -50,15 +51,16 @@ namespace smt::noodler::ecma::test {
     std::string parse_and_serialize(const char* pattern) {
         return parse_and_serialize(raw(pattern));
     }
-}  // namespace smt::noodler::ecma::test
+}  // namespace smt::noodler::extended_regex::test
 
 // =====================================================================
 // INPUT DECODING TESTS
 // =====================================================================
 
 TEST_CASE("ECMA Regex input decoding", "[noodler][ecma]") {
-    using namespace smt::noodler::ecma;
-    using namespace smt::noodler::ecma::test;
+    using namespace smt::noodler::extended_regex;
+    using namespace smt::noodler::extended_regex::ecma;
+    using namespace smt::noodler::extended_regex::test;
 
     SECTION("ASCII is kept") {
         REQUIRE(code_points(sanitize_ecma_regex_input(raw("a(b)*"))) ==
@@ -108,8 +110,9 @@ TEST_CASE("ECMA Regex input decoding", "[noodler][ecma]") {
 // =====================================================================
 
 TEST_CASE("ECMA Regex Parser", "[noodler][ecma]") {
-    using namespace smt::noodler::ecma;
-    using namespace smt::noodler::ecma::test;
+    using namespace smt::noodler::extended_regex;
+    using namespace smt::noodler::extended_regex::ecma;
+    using namespace smt::noodler::extended_regex::test;
 
     // ---- 21.2.1 Pattern, Disjunction, Alternative ----
 
@@ -153,8 +156,8 @@ TEST_CASE("ECMA Regex Parser", "[noodler][ecma]") {
     }
 
     SECTION("Dot") {
-        REQUIRE(parse_and_serialize(".") == "(SEQ (DOT))");
-        REQUIRE(parse_and_serialize(".*") == "(SEQ (QUANT {0,inf} (DOT)))");
+        REQUIRE(parse_and_serialize(".") == "(SEQ (CLASS (CHAR_CLASS .)))");
+        REQUIRE(parse_and_serialize(".*") == "(SEQ (QUANT {0,inf} (CLASS (CHAR_CLASS .))))");
     }
 
     // ---- 21.2.1 Quantifier ----
@@ -468,28 +471,28 @@ TEST_CASE("ECMA Regex Parser", "[noodler][ecma]") {
     // ---- 21.2.1 CharacterClassEscape ----
 
     SECTION("Character class escapes") {
-        REQUIRE(parse_and_serialize("\\d") == "(SEQ (CLASS (CHAR_CLASS 'd')))");
-        REQUIRE(parse_and_serialize("\\D") == "(SEQ (CLASS (CHAR_CLASS 'D')))");
-        REQUIRE(parse_and_serialize("\\s") == "(SEQ (CLASS (CHAR_CLASS 's')))");
-        REQUIRE(parse_and_serialize("\\S") == "(SEQ (CLASS (CHAR_CLASS 'S')))");
-        REQUIRE(parse_and_serialize("\\w") == "(SEQ (CLASS (CHAR_CLASS 'w')))");
-        REQUIRE(parse_and_serialize("\\W") == "(SEQ (CLASS (CHAR_CLASS 'W')))");
-        REQUIRE(parse_and_serialize("\\d+") == "(SEQ (QUANT {1,inf} (CLASS (CHAR_CLASS 'd'))))");
+        REQUIRE(parse_and_serialize("\\d") == "(SEQ (CLASS (CHAR_CLASS \\d)))");
+        REQUIRE(parse_and_serialize("\\D") == "(SEQ (CLASS (CHAR_CLASS \\D)))");
+        REQUIRE(parse_and_serialize("\\s") == "(SEQ (CLASS (CHAR_CLASS \\s)))");
+        REQUIRE(parse_and_serialize("\\S") == "(SEQ (CLASS (CHAR_CLASS \\S)))");
+        REQUIRE(parse_and_serialize("\\w") == "(SEQ (CLASS (CHAR_CLASS \\w)))");
+        REQUIRE(parse_and_serialize("\\W") == "(SEQ (CLASS (CHAR_CLASS \\W)))");
+        REQUIRE(parse_and_serialize("\\d+") == "(SEQ (QUANT {1,inf} (CLASS (CHAR_CLASS \\d))))");
     }
 
     SECTION("Unicode property escapes") {
         // Lone General_Category values (Table 57) and binary properties (Table 56)
-        REQUIRE(parse_and_serialize("\\p{Lu}") == "(SEQ (CLASS (CHAR_CLASS 'p' {Lu})))");
-        REQUIRE(parse_and_serialize("\\P{Uppercase_Letter}") == "(SEQ (CLASS (CHAR_CLASS 'P' {Uppercase_Letter})))");
-        REQUIRE(parse_and_serialize("\\p{ASCII}") == "(SEQ (CLASS (CHAR_CLASS 'p' {ASCII})))");
-        REQUIRE(parse_and_serialize("\\p{Any}") == "(SEQ (CLASS (CHAR_CLASS 'p' {Any})))");
+        REQUIRE(parse_and_serialize("\\p{Lu}") == "(SEQ (CLASS (CHAR_CLASS \\p{Lu})))");
+        REQUIRE(parse_and_serialize("\\P{Uppercase_Letter}") == "(SEQ (CLASS (CHAR_CLASS \\P{Uppercase_Letter})))");
+        REQUIRE(parse_and_serialize("\\p{ASCII}") == "(SEQ (CLASS (CHAR_CLASS \\p{ASCII})))");
+        REQUIRE(parse_and_serialize("\\p{Any}") == "(SEQ (CLASS (CHAR_CLASS \\p{Any})))");
         // Name=Value forms (Table 55 with Table 57 or Table 58)
-        REQUIRE(parse_and_serialize("\\p{gc=Lu}") == "(SEQ (CLASS (CHAR_CLASS 'p' {gc=Lu})))");
+        REQUIRE(parse_and_serialize("\\p{gc=Lu}") == "(SEQ (CLASS (CHAR_CLASS \\p{gc=Lu})))");
         REQUIRE(parse_and_serialize("\\p{General_Category=Decimal_Number}") ==
-                "(SEQ (CLASS (CHAR_CLASS 'p' {General_Category=Decimal_Number})))");
-        REQUIRE(parse_and_serialize("\\p{Script=Greek}") == "(SEQ (CLASS (CHAR_CLASS 'p' {Script=Greek})))");
-        REQUIRE(parse_and_serialize("\\P{scx=Latn}") == "(SEQ (CLASS (CHAR_CLASS 'P' {scx=Latn})))");
-        REQUIRE(parse_and_serialize("[\\p{L}\\d]") == "(SEQ (CLASS (CHAR_CLASS 'p' {L}) (CHAR_CLASS 'd')))");
+                "(SEQ (CLASS (CHAR_CLASS \\p{General_Category=Decimal_Number})))");
+        REQUIRE(parse_and_serialize("\\p{Script=Greek}") == "(SEQ (CLASS (CHAR_CLASS \\p{Script=Greek})))");
+        REQUIRE(parse_and_serialize("\\P{scx=Latn}") == "(SEQ (CLASS (CHAR_CLASS \\P{scx=Latn})))");
+        REQUIRE(parse_and_serialize("[\\p{L}\\d]") == "(SEQ (CLASS (CHAR_CLASS \\p{L}) (CHAR_CLASS \\d)))");
     }
 
     SECTION("Invalid Unicode property escapes throw") {
@@ -522,9 +525,9 @@ TEST_CASE("ECMA Regex Parser", "[noodler][ecma]") {
         REQUIRE(parse_and_serialize("[a-zA-Z]") == "(SEQ (CLASS (RANGE 'a' 'z') (RANGE 'A' 'Z')))");
         REQUIRE(parse_and_serialize("[a-zA-Z0-9]") == "(SEQ (CLASS (RANGE 'a' 'z') (RANGE 'A' 'Z') (RANGE '0' '9')))");
         REQUIRE(parse_and_serialize("[_a-z]") == "(SEQ (CLASS (LIT '_') (RANGE 'a' 'z')))");
-        REQUIRE(parse_and_serialize("[\\d\\s]") == "(SEQ (CLASS (CHAR_CLASS 'd') (CHAR_CLASS 's')))");
-        REQUIRE(parse_and_serialize("[^a-z\\d_]") == "(SEQ (CLASS ^ (RANGE 'a' 'z') (CHAR_CLASS 'd') (LIT '_')))");
-        REQUIRE(parse_and_serialize("[^\\w0-9]") == "(SEQ (CLASS ^ (CHAR_CLASS 'w') (RANGE '0' '9')))");
+        REQUIRE(parse_and_serialize("[\\d\\s]") == "(SEQ (CLASS (CHAR_CLASS \\d) (CHAR_CLASS \\s)))");
+        REQUIRE(parse_and_serialize("[^a-z\\d_]") == "(SEQ (CLASS ^ (RANGE 'a' 'z') (CHAR_CLASS \\d) (LIT '_')))");
+        REQUIRE(parse_and_serialize("[^\\w0-9]") == "(SEQ (CLASS ^ (CHAR_CLASS \\w) (RANGE '0' '9')))");
         REQUIRE(parse_and_serialize("[a-z]+") == "(SEQ (QUANT {1,inf} (CLASS (RANGE 'a' 'z'))))");
     }
 
@@ -543,8 +546,8 @@ TEST_CASE("ECMA Regex Parser", "[noodler][ecma]") {
         REQUIRE(parse_and_serialize("[---]") == "(SEQ (CLASS (LIT '-')))");
         REQUIRE(parse_and_serialize("[--/]") == "(SEQ (CLASS (RANGE '-' '/')))");
         REQUIRE(parse_and_serialize("[a-c-e]") == "(SEQ (CLASS (RANGE 'a' 'c') (LIT '-') (LIT 'e')))");
-        REQUIRE(parse_and_serialize("[\\d-]") == "(SEQ (CLASS (CHAR_CLASS 'd') (LIT '-')))");
-        REQUIRE(parse_and_serialize("[-\\d]") == "(SEQ (CLASS (LIT '-') (CHAR_CLASS 'd')))");
+        REQUIRE(parse_and_serialize("[\\d-]") == "(SEQ (CLASS (CHAR_CLASS \\d) (LIT '-')))");
+        REQUIRE(parse_and_serialize("[-\\d]") == "(SEQ (CLASS (LIT '-') (CHAR_CLASS \\d)))");
         REQUIRE(parse_and_serialize("[^-]") == "(SEQ (CLASS ^ (LIT '-')))");
     }
 
@@ -654,11 +657,11 @@ TEST_CASE("ECMA Regex Parser", "[noodler][ecma]") {
     SECTION("Date pattern with named groups") {
         REQUIRE(parse_and_serialize("(?<year>\\d{4})-(?<month>\\d{2})-(?<day>\\d{2})") ==
                 "(SEQ"
-                " (GROUP #1 <year> (SEQ (QUANT {4,4} (CLASS (CHAR_CLASS 'd')))))"
+                " (GROUP #1 <year> (SEQ (QUANT {4,4} (CLASS (CHAR_CLASS \\d)))))"
                 " (LIT '-')"
-                " (GROUP #2 <month> (SEQ (QUANT {2,2} (CLASS (CHAR_CLASS 'd')))))"
+                " (GROUP #2 <month> (SEQ (QUANT {2,2} (CLASS (CHAR_CLASS \\d)))))"
                 " (LIT '-')"
-                " (GROUP #3 <day> (SEQ (QUANT {2,2} (CLASS (CHAR_CLASS 'd')))))"
+                " (GROUP #3 <day> (SEQ (QUANT {2,2} (CLASS (CHAR_CLASS \\d)))))"
                 ")");
     }
 
@@ -683,7 +686,7 @@ TEST_CASE("ECMA Regex Parser", "[noodler][ecma]") {
 // RCG SERIALIZATION HELPERS
 // =====================================================================
 
-namespace smt::noodler::ecma::test {
+namespace smt::noodler::extended_regex::test {
 
     // Converts a Z3 app_ref to a normalized string (collapses whitespace, removes newlines).
     std::string app_to_string(const app_ref& app, ast_manager& m) {
@@ -895,12 +898,13 @@ namespace smt::noodler::ecma::test {
     std::string build_and_serialize_rcg(const std::string& regex, ast_manager& m) {
         theory_str_noodler_params params;
         params.m_ecma_engine_semantics = true;
-        RegexConstraintBuilder builder(m, raw(regex), params);
+        const ecma::ECMARegex ecma_regex(raw(regex));
+        RegexConstraintBuilder builder(m, ecma_regex, params);
         const RegexConstraintGraph& rcg = builder.build_rcg();
         return serialize_rcg(rcg, m);
     }
 
-}  // namespace smt::noodler::ecma::test
+}  // namespace smt::noodler::extended_regex::test
 
 // =====================================================================
 // RCG GENERATION FROM AST – UNIT TESTS
@@ -908,8 +912,9 @@ namespace smt::noodler::ecma::test {
 
 TEST_CASE("ECMA Regex RCG generation from AST", "[noodler][ecma]") {
     using Catch::Matchers::ContainsSubstring;
-    using namespace smt::noodler::ecma;
-    using namespace smt::noodler::ecma::test;
+    using namespace smt::noodler::extended_regex;
+    using namespace smt::noodler::extended_regex::ecma;
+    using namespace smt::noodler::extended_regex::test;
 
     ast_manager m;
     reg_decl_plugins(m);
@@ -1005,18 +1010,17 @@ TEST_CASE("ECMA Regex RCG generation from AST", "[noodler][ecma]") {
         REQUIRE(std::holds_alternative<app_ref>(group_node.get_subgraph(graph, util_s, m)));
     }
 
-    SECTION("ASTNodeDot matches all characters except line terminators") {
-        ASTNodeDot dot_node;
-        RegexComponent comp = dot_node.get_subgraph(graph, util_s, m);
+    SECTION("ASTNodeCharClass with a negated CharSet is its complement") {
+        ASTNodeCharClass char_class(false);
+        char_class.add_item(CharSet {{{0x000A, 0x000A}, {0x2028, 0x2029}}, true, zstring_view()});
 
+        RegexComponent comp = char_class.get_subgraph(graph, util_s, m);
         REQUIRE(std::holds_alternative<app_ref>(comp));
         REQUIRE(graph.vertices.empty());
 
-        // Sigma \ LineTerminator (Table 33)
-        app* line_terminators = util_s.re.mk_union(
-            util_s.re.mk_union(util_s.re.mk_union(mk_char(0x000A), mk_char(0x000D)), mk_char(0x2028)), mk_char(0x2029));
-        const app_ref expected(
-            util_s.re.mk_inter(util_s.re.mk_full_char(nullptr), util_s.re.mk_complement(line_terminators)), m);
+        sort* re_sort = util_s.re.mk_re(util_s.mk_string_sort());
+        app* chars = util_s.re.mk_union(mk_char(0x000A), util_s.re.mk_range(re_sort, 0x2028, 0x2029));
+        const app_ref expected(util_s.re.mk_inter(util_s.re.mk_full_char(nullptr), util_s.re.mk_complement(chars)), m);
         REQUIRE(app_to_string(std::get<app_ref>(comp), m) == app_to_string(expected, m));
     }
 
@@ -1207,7 +1211,7 @@ TEST_CASE("ECMA Regex RCG generation from AST", "[noodler][ecma]") {
         ASTNodeCharClass char_class(false);
         char_class.add_item(ClassRange {'a', 'z'});
         char_class.add_item(ClassRange {'_', '_'});
-        char_class.add_item(CharClassEscape {ClassEscapeKind::DIGIT});
+        char_class.add_item(CharSet {{{'0', '9'}}, false, zstring_view()});
 
         app_ref z3_regex = std::get<app_ref>(char_class.get_subgraph(graph, util_s, m));
         REQUIRE(app_to_string(z3_regex, m) ==
@@ -1229,33 +1233,31 @@ TEST_CASE("ECMA Regex RCG generation from AST", "[noodler][ecma]") {
         REQUIRE(app_to_string(all_regex, m) == "re.allchar");
     }
 
-    SECTION("ASTNodeCharClass with \\s contains WhiteSpace and LineTerminator characters") {
-        ASTNodeCharClass char_class(false);
-        char_class.add_item(CharClassEscape {ClassEscapeKind::SPACE});
+    SECTION("CharSet without representable characters is empty") {
+        const unsigned max_char = util_s.max_char();
 
-        // WhiteSpace (Table 32, including the Zs category) and LineTerminator (Table 33)
-        const std::vector<std::pair<unsigned, unsigned>> whitespace_ranges {
-            {0x0009, 0x000D}, {0x0020, 0x0020}, {0x00A0, 0x00A0}, {0x1680, 0x1680}, {0x2000, 0x200A},
-            {0x2028, 0x2029}, {0x202F, 0x202F}, {0x205F, 0x205F}, {0x3000, 0x3000}, {0xFEFF, 0xFEFF}};
-        sort* re_sort = util_s.re.mk_re(util_s.mk_string_sort());
-        app* whitespaces = nullptr;
-        for (const auto& [lo, hi] : whitespace_ranges) {
-            app* range = util_s.re.mk_range(re_sort, lo, hi);
-            whitespaces = whitespaces == nullptr ? range : util_s.re.mk_union(whitespaces, range);
-        }
-        const app_ref expected(whitespaces, m);
+        ASTNodeCharClass empty_set_class(false);
+        empty_set_class.add_item(CharSet {{{max_char + 1, 0x10FFFF}}, false, zstring_view()});
+        app_ref empty_regex = std::get<app_ref>(empty_set_class.get_subgraph(graph, util_s, m));
+        REQUIRE(app_to_string(empty_regex, m) == "re.none");
 
-        app_ref z3_regex = std::get<app_ref>(char_class.get_subgraph(graph, util_s, m));
-        REQUIRE(app_to_string(z3_regex, m) == app_to_string(expected, m));
-        REQUIRE(app_to_string(z3_regex, m).find("\\u{1f}") == std::string::npos);
+        ASTNodeCharClass full_set_class(false);
+        full_set_class.add_item(CharSet {{{max_char + 1, 0x10FFFF}}, true, zstring_view()});
+        app_ref full_regex = std::get<app_ref>(full_set_class.get_subgraph(graph, util_s, m));
+        REQUIRE(app_to_string(full_regex, m) == "re.allchar");
     }
 
-    SECTION("ASTNodeCharClass with \\W is a complement of word characters") {
+    SECTION("ASTNodeCharClass with a negated CharSet among other items") {
         ASTNodeCharClass char_class(false);
-        char_class.add_item(CharClassEscape {ClassEscapeKind::NOT_WORD});
+        char_class.add_item(ClassRange {'a', 'a'});
+        char_class.add_item(CharSet {{{'0', '9'}, {'_', '_'}}, true, zstring_view()});
 
+        app* word_like = util_s.re.mk_union(util_s.re.mk_range(util_s.str.mk_string("0"), util_s.str.mk_string("9")),
+                                            mk_char('_'));
         const app_ref expected(
-            util_s.re.mk_inter(util_s.re.mk_full_char(nullptr), util_s.re.mk_complement(util_s.re.mk_word_char())), m);
+            util_s.re.mk_union(mk_char('a'), util_s.re.mk_inter(util_s.re.mk_full_char(nullptr),
+                                                                util_s.re.mk_complement(word_like))),
+            m);
 
         app_ref z3_regex = std::get<app_ref>(char_class.get_subgraph(graph, util_s, m));
         REQUIRE(app_to_string(z3_regex, m) == app_to_string(expected, m));
@@ -1264,7 +1266,7 @@ TEST_CASE("ECMA Regex RCG generation from AST", "[noodler][ecma]") {
     SECTION("ASTNodeCharClass with a Unicode property escape throws") {
         ASTNodeCharClass char_class(false);
         const zstring property_value("Lu");
-        char_class.add_item(CharClassEscape {ClassEscapeKind::PROPERTY, zstring_view(), property_value});
+        char_class.add_item(UnicodeProperty {false, zstring_view(), property_value, property_value});
         REQUIRE_THROWS(char_class.get_subgraph(graph, util_s, m));
     }
 
@@ -1294,11 +1296,58 @@ TEST_CASE("ECMA Regex RCG generation from AST", "[noodler][ecma]") {
 
 TEST_CASE("ECMA Regex serialized RCG tests", "[noodler][ecma]") {
     using Catch::Matchers::ContainsSubstring;
-    using namespace smt::noodler::ecma;
-    using namespace smt::noodler::ecma::test;
+    using namespace smt::noodler::extended_regex;
+    using namespace smt::noodler::extended_regex::ecma;
+    using namespace smt::noodler::extended_regex::test;
 
     ast_manager m;
     reg_decl_plugins(m);
+    seq_util util_s(m);
+
+    // ---- ECMAScript sets of characters (21.2.2.8 Atom, 21.2.2.12 CharacterClassEscape) ----
+
+    // The expected RCG of a regex matching a single character from the union of @p ranges (or its complement)
+    auto char_set_rcg = [&](const std::vector<std::pair<unsigned, unsigned>>& ranges, const bool negated) {
+        sort* re_sort = util_s.re.mk_re(util_s.mk_string_sort());
+        app* set = nullptr;
+        for (const auto& [lo, hi] : ranges) {
+            app* range = util_s.re.mk_range(re_sort, lo, hi);
+            set = set == nullptr ? range : util_s.re.mk_union(set, range);
+        }
+        if (negated) {
+            set = util_s.re.mk_inter(util_s.re.mk_full_char(nullptr), util_s.re.mk_complement(set));
+        }
+        return "(RCG (EDGE *->* [MATCH re.all]) (EDGE *->* [MATCH " + app_to_string(app_ref(set, m), m) +
+               "]) (EDGE *->* [MATCH re.all]))";
+    };
+    const std::vector<std::pair<unsigned, unsigned>> digits {{'0', '9'}};
+    // WordCharacters() with IgnoreCase = false (21.2.2.6.1)
+    const std::vector<std::pair<unsigned, unsigned>> word_chars {{'0', '9'}, {'A', 'Z'}, {'_', '_'}, {'a', 'z'}};
+    // WhiteSpace (11.2 Table 32, including the Zs category) and LineTerminator (11.3 Table 33)
+    const std::vector<std::pair<unsigned, unsigned>> whitespaces {
+        {0x0009, 0x000D}, {0x0020, 0x0020}, {0x00A0, 0x00A0}, {0x1680, 0x1680}, {0x2000, 0x200A},
+        {0x2028, 0x2029}, {0x202F, 0x202F}, {0x205F, 0x205F}, {0x3000, 0x3000}, {0xFEFF, 0xFEFF}};
+    const std::vector<std::pair<unsigned, unsigned>> line_terminators {
+        {0x000A, 0x000A}, {0x000D, 0x000D}, {0x2028, 0x2029}};
+
+    SECTION("Dot matches all characters except line terminators") {
+        REQUIRE(build_and_serialize_rcg(".", m) == char_set_rcg(line_terminators, true));
+    }
+
+    SECTION("Digit escapes") {
+        REQUIRE(build_and_serialize_rcg("\\d", m) == char_set_rcg(digits, false));
+        REQUIRE(build_and_serialize_rcg("\\D", m) == char_set_rcg(digits, true));
+    }
+
+    SECTION("Whitespace escapes") {
+        REQUIRE(build_and_serialize_rcg("\\s", m) == char_set_rcg(whitespaces, false));
+        REQUIRE(build_and_serialize_rcg("\\S", m) == char_set_rcg(whitespaces, true));
+    }
+
+    SECTION("Word character escapes") {
+        REQUIRE(build_and_serialize_rcg("\\w", m) == char_set_rcg(word_chars, false));
+        REQUIRE(build_and_serialize_rcg("\\W", m) == char_set_rcg(word_chars, true));
+    }
 
     // ---- Basic cases ----
 
